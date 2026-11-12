@@ -1,0 +1,14 @@
+# The gate's own slice (user manager). Installed by sluicy's install.sh.
+#
+# systemd-oomd (on by default on Ubuntu and Fedora) watches the whole user session and, when its
+# memory pressure stays high, may kill the user manager itself: the desktop, every terminal and every
+# coding session go with it. A gate's stalls count toward that pressure, so the gate gets a stricter
+# watch of its own: oomd kills the gate's scope (a red ticket) long before the session crosses its
+# line. oomd only kills descendants of a watched unit, which is why this is a slice with the gate's
+# scope inside it, not a property on the scope.
+[Unit]
+Description=sluicy gate
+
+[Slice]
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=25%

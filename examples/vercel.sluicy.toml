@@ -1,0 +1,16 @@
+# A repository whose host builds and deploys every push to main (Vercel, Netlify, Cloudflare Pages...).
+# sluicy queues, merges and runs the pre-push gate one at a time; the push itself is the deploy.
+project = "shop"
+
+[components.app]
+path = "app"
+
+[deploy]
+kind = "none"
+
+[gate]
+waivers = ["SKIP_BUILD"]
+mem_reserve_gb = 4
+
+[deps]
+"pnpm-lock.yaml" = ["pnpm", "install", "--frozen-lockfile"]

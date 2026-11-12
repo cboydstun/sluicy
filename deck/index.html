@@ -1,0 +1,1460 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Session Deck</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --ink: #1d232b;
+        --muted: #626d7a;
+        --line: #e2e6eb;
+        --accent: #2f6fde;
+        --ok: #1f8a4c;
+        --warn: #b26a00;
+        --bad: #c4322b;
+        --chip: #eef1f5;
+        --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #111418;
+          --panel: #191d23;
+          --ink: #e5e9ee;
+          --muted: #8d97a3;
+          --line: #2a3038;
+          --accent: #6ea0ff;
+          --ok: #4cc27d;
+          --warn: #e3a33b;
+          --bad: #ff6b62;
+          --chip: #232931;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font:
+          14px/1.45 system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 12px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+        position: sticky;
+        top: 0;
+        z-index: 5;
+      }
+      header h1 {
+        font-size: 16px;
+        margin: 0;
+      }
+      header .meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      header .spacer {
+        flex: 1;
+      }
+      .warnbar {
+        background: var(--bad);
+        color: #fff;
+        padding: 8px 20px;
+        font-weight: 600;
+        display: none;
+      }
+      main {
+        display: grid;
+        grid-template-columns: minmax(0, 2.2fr) minmax(320px, 1fr);
+        gap: 16px;
+        padding: 16px 20px;
+      }
+      @media (max-width: 1100px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+      }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+      section > h2 {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+        margin: 0;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+      section > h2 .spacer {
+        flex: 1;
+      }
+      .stack {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        min-width: 0;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 7px 10px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+      th {
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      td.num {
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .mono {
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .small {
+        font-size: 12px;
+      }
+      .chip {
+        display: inline-block;
+        padding: 1px 8px;
+        border-radius: 99px;
+        background: var(--chip);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .chip.ok {
+        color: var(--ok);
+      }
+      .chip.warn {
+        color: var(--warn);
+      }
+      .chip.bad {
+        color: var(--bad);
+      }
+      .chip.accent {
+        color: var(--accent);
+      }
+      .dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 6px;
+        background: var(--muted);
+      }
+      .dot.busy {
+        background: var(--accent);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+      }
+      .dot.idle {
+        background: var(--ok);
+      }
+      .dot.waiting {
+        background: var(--warn);
+      }
+      td.who {
+        min-width: 230px;
+      }
+      #procs .last {
+        max-width: 300px;
+      }
+      .last {
+        color: var(--muted);
+        font-size: 12px;
+        max-width: 520px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      button {
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--ink);
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: var(--accent);
+      }
+      button.primary {
+        background: var(--accent);
+        color: #fff;
+        border-color: var(--accent);
+      }
+      button.danger {
+        color: var(--bad);
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .kv {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 4px 12px;
+        padding: 10px 14px;
+      }
+      .meter {
+        height: 6px;
+        background: var(--chip);
+        border-radius: 3px;
+        overflow: hidden;
+        margin-top: 3px;
+      }
+      .meter > div {
+        height: 100%;
+        background: var(--accent);
+      }
+      .meter.hot > div {
+        background: var(--bad);
+      }
+      .pad {
+        padding: 10px 14px;
+      }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+      .empty {
+        padding: 14px;
+        color: var(--muted);
+      }
+      dialog {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+        color: var(--ink);
+        padding: 0;
+        width: min(760px, 94vw);
+      }
+      dialog.wide {
+        width: min(1240px, 96vw);
+      }
+      dialog::backdrop {
+        background: rgba(0, 0, 0, 0.35);
+      }
+      dialog .head {
+        display: flex;
+        align-items: center;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--line);
+        font-weight: 600;
+      }
+      dialog .head .spacer {
+        flex: 1;
+      }
+      dialog .body {
+        padding: 14px 16px;
+        max-height: 70vh;
+        overflow: auto;
+      }
+      dialog .foot {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        padding: 12px 16px;
+        border-top: 1px solid var(--line);
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin: 10px 0 4px;
+      }
+      input[type="text"],
+      select,
+      textarea {
+        width: 100%;
+        font: inherit;
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--ink);
+      }
+      textarea {
+        min-height: 90px;
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .row label {
+        margin: 0;
+        display: inline-flex;
+        gap: 5px;
+        align-items: center;
+        color: var(--ink);
+      }
+      .result {
+        margin-top: 10px;
+      }
+      .msg {
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: var(--chip);
+        margin-bottom: 8px;
+      }
+      .msg.assistant {
+        border-left: 3px solid var(--accent);
+      }
+      .msg.tool {
+        background: transparent;
+        padding: 1px 10px;
+        margin-bottom: 2px;
+        color: var(--muted);
+      }
+      .msg .who {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+      .send[hidden],
+      #term-back[hidden] {
+        display: none;
+      }
+      #term {
+        height: 420px;
+        background: #0d1117;
+        padding: 6px;
+      }
+      .send {
+        display: flex;
+        gap: 8px;
+        padding: 10px 14px;
+        border-top: 1px solid var(--line);
+      }
+      .send input {
+        flex: 1;
+      }
+      #needs-wrap {
+        border-color: var(--warn);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 30%, transparent);
+      }
+      #needs-wrap[hidden] {
+        display: none;
+      }
+      #needs-wrap > h2 {
+        color: var(--warn);
+      }
+      .need {
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+      .need:last-child {
+        border-bottom: 0;
+      }
+      .need .top {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .need .top .spacer {
+        flex: 1;
+      }
+      .need .detail {
+        margin-top: 6px;
+        max-height: 220px;
+        overflow: auto;
+        background: var(--chip);
+        border-radius: 6px;
+        padding: 6px 8px;
+      }
+      .need .q {
+        margin: 2px 0 4px;
+        font-weight: 600;
+      }
+      .need ol {
+        margin: 0 0 6px;
+        padding-left: 22px;
+      }
+      .need ol li .muted {
+        font-size: 12px;
+      }
+      tr.needs td {
+        background: color-mix(in srgb, var(--warn) 9%, transparent);
+      }
+      tr.needs td:first-child {
+        box-shadow: inset 3px 0 0 var(--warn);
+      }
+      #btn-notify[hidden] {
+        display: none;
+      }
+      .toast {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        background: var(--ink);
+        color: var(--panel);
+        padding: 10px 14px;
+        border-radius: 8px;
+        max-width: 480px;
+        display: none;
+        z-index: 20;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Session Deck</h1>
+      <span class="meta" id="meta">loading…</span>
+      <span class="spacer"></span>
+      <button
+        id="btn-notify"
+        hidden
+        title="Desktop alert when a session needs you while this tab is in the background"
+      >
+        Alert me
+      </button>
+      <button id="btn-new-session" class="primary">New session</button>
+      <button id="btn-submit">Submit to queue</button>
+    </header>
+    <div class="warnbar" id="warnbar"></div>
+    <main>
+      <div class="stack">
+        <section id="needs-wrap" hidden>
+          <h2>
+            Needs you <span id="needs-count" class="chip warn"></span
+            ><span class="spacer"></span
+            ><span class="small muted" style="text-transform: none"
+              >Open a session to answer in its terminal</span
+            >
+          </h2>
+          <div id="needs"></div>
+        </section>
+        <section id="cleanup-wrap" hidden>
+          <h2>
+            Clean up <span id="cleanup-count" class="chip"></span
+            ><span class="spacer"></span
+            ><span class="small muted" style="text-transform: none"
+              >From the sluicy conductor; each row asks before it acts</span
+            >
+          </h2>
+          <div id="cleanup"></div>
+        </section>
+        <section id="term-wrap">
+          <h2>
+            Terminal <span id="term-title" class="mono"></span
+            ><span class="spacer"></span
+            ><button id="term-back" hidden>Back to the queue</button>
+          </h2>
+          <div id="term"></div>
+          <div class="send" id="term-send-row" hidden>
+            <input
+              type="text"
+              id="term-line"
+              placeholder="Type a message and press Enter to send it to the session"
+            /><button id="term-send" class="primary">Send</button>
+          </div>
+        </section>
+        <section>
+          <h2>
+            Sessions <span class="spacer"></span
+            ><span class="small muted" id="agents-err"></span>
+          </h2>
+          <div id="sessions"></div>
+        </section>
+        <section>
+          <h2>
+            Release queue <span class="spacer"></span><span id="guards"></span>
+          </h2>
+          <div id="queue"></div>
+        </section>
+        <section>
+          <h2>Worktrees</h2>
+          <div id="worktrees"></div>
+        </section>
+      </div>
+      <div class="stack">
+        <section>
+          <h2>Laptop</h2>
+          <div id="system"></div>
+        </section>
+        <section>
+          <h2>Production</h2>
+          <div id="vps"></div>
+        </section>
+        <section>
+          <h2>Processes by memory</h2>
+          <div id="procs"></div>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="dlg">
+      <div class="head">
+        <span id="dlg-title"></span><span class="spacer"></span
+        ><button data-close>✕</button>
+      </div>
+      <div class="body" id="dlg-body"></div>
+      <div class="foot" id="dlg-foot"></div>
+    </dialog>
+    <div class="toast" id="toast"></div>
+
+    <script>
+      "use strict";
+      const TOKEN = new URLSearchParams(location.search).get("t") || "";
+      let S = null; // last state
+      const $ = (id) => document.getElementById(id);
+      const esc = (s) =>
+        String(s ?? "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      const gb = (b) =>
+        b == null
+          ? "?"
+          : b >= 1 << 30
+            ? (b / (1 << 30)).toFixed(1) + " GB"
+            : (b / (1 << 20)).toFixed(0) + " MB";
+      const ago = (t) => {
+        if (!t) return "—";
+        const s = Math.max(0, Date.now() / 1000 - t);
+        return s < 60
+          ? Math.round(s) + "s"
+          : s < 3600
+            ? Math.round(s / 60) + "m"
+            : s < 86400
+              ? (s / 3600).toFixed(1) + "h"
+              : Math.round(s / 86400) + "d";
+      };
+      const stateChip = (st) => {
+        const cls =
+          {
+            live: "ok",
+            merged: "ok",
+            failed: "bad",
+            conflict: "bad",
+            rolled_back: "bad",
+            unknown: "bad",
+            blocked: "warn",
+            held: "warn",
+          }[st] || "accent";
+        return `<span class="chip ${cls}">${esc(st)}</span>`;
+      };
+
+      function toast(text, ms = 5000) {
+        const t = $("toast");
+        t.textContent = text;
+        t.style.display = "block";
+        clearTimeout(t._h);
+        t._h = setTimeout(() => (t.style.display = "none"), ms);
+      }
+
+      async function api(path, body) {
+        const opts = { headers: { "X-Deck-Token": TOKEN } };
+        if (body !== undefined) {
+          opts.method = "POST";
+          opts.headers["Content-Type"] = "application/json";
+          opts.body = JSON.stringify(body);
+        }
+        const r = await fetch(path, opts);
+        let data = {};
+        try {
+          data = await r.json();
+        } catch (_) {}
+        if (!r.ok) throw new Error(data.error || data.output || r.status);
+        return data;
+      }
+      const act = (name, body) => api(`/api/action/${name}`, body);
+
+      // ---- dialog
+      function dialog(title, bodyHtml, buttons) {
+        $("dlg-title").textContent = title;
+        $("dlg-body").innerHTML = bodyHtml;
+        const foot = $("dlg-foot");
+        foot.innerHTML = "";
+        for (const [label, cls, fn] of buttons || []) {
+          const b = document.createElement("button");
+          b.textContent = label;
+          if (cls) b.className = cls;
+          b.onclick = async () => {
+            b.disabled = true;
+            try {
+              await fn();
+              // An action that ran stays done: a second click would start a second session or
+              // repeat the action. The dialog's ✕ or Cancel closes it.
+              if (cls === "primary") return;
+            } catch (e) {
+              showResult(String(e.message || e), true);
+            }
+            b.disabled = false;
+          };
+          foot.appendChild(b);
+        }
+        $("dlg").showModal();
+      }
+      function showResult(text, bad) {
+        let r = $("dlg-body").querySelector(".result");
+        if (!r) {
+          r = document.createElement("div");
+          r.className = "result";
+          $("dlg-body").appendChild(r);
+        }
+        r.innerHTML = `<pre class="${bad ? "chip bad" : ""}" style="display:block;padding:8px">${esc(text)}</pre>`;
+      }
+      document.querySelector("[data-close]").onclick = () => $("dlg").close();
+      const textDialog = (title, text) =>
+        dialog(title, `<pre>${esc(text)}</pre>`, [
+          ["Close", "", () => $("dlg").close()],
+        ]);
+
+      // ---- rendering
+      function render() {
+        const s = S;
+        $("meta").textContent =
+          `${s.sessions.length} sessions · refreshed ${new Date(s.now * 1000).toLocaleTimeString()}`;
+        $("agents-err").textContent = s.agentsError
+          ? "claude agents: " + s.agentsError
+          : "";
+        const warns = s.system.warnings;
+        $("warnbar").style.display = warns.length ? "block" : "none";
+        $("warnbar").textContent = warns.length
+          ? "⚠ " +
+            warns.join(" · ") +
+            " — the gate froze this laptop under memory pressure before"
+          : "";
+        renderNeeds(s);
+        renderCleanup(s);
+        renderSessions(s);
+        renderQueue(s);
+        renderWorktrees(s);
+        renderSystem(s);
+        renderVps(s);
+        renderProcs(s);
+      }
+
+      // ---- sessions waiting on the person: a permission prompt, a question, a plan to approve, or
+      // a finished turn that asked something. Pinned above everything until answered.
+      const DISMISS_KEY = "deck-dismissed-needs";
+      let dismissed = {};
+      try {
+        dismissed = JSON.parse(localStorage.getItem(DISMISS_KEY) || "{}");
+      } catch (_) {}
+      // A dismissal holds for that one wait only: the next status change brings the session back.
+      const needKey = (x) => `${x.id}@${x.statusSince}`;
+      const activeNeed = (x) =>
+        x.needs && !(x.needs.kind === "reply" && dismissed[x.id] === needKey(x))
+          ? x.needs
+          : null;
+      // Prompts block work and come first; a turn that ended with a question can wait.
+      const needRank = (x) => {
+        const n = activeNeed(x);
+        return !n ? 2 : n.kind === "reply" ? 1 : 0;
+      };
+      function needDetail(n) {
+        const t = n.tool;
+        if (t && t.questions && t.questions.length)
+          return t.questions
+            .map(
+              (q) =>
+                `<div class="q">${q.header ? `<span class="chip">${esc(q.header)}</span> ` : ""}${esc(q.question)}${q.multiSelect ? ` <span class="small muted">(pick any)</span>` : ""}</div><ol>${q.options.map((o) => `<li>${esc(o.label)}${o.description ? ` <span class="muted">— ${esc(o.description)}</span>` : ""}</li>`).join("")}</ol>`,
+            )
+            .join("");
+        if (t && t.plan) return `<pre>${esc(t.plan)}</pre>`;
+        if (t && t.command)
+          return `<div class="small muted">${esc(t.name)}</div><pre>${esc(t.command)}</pre>`;
+        if (t && n.kind !== "reply") return `<pre>${esc(t.line)}</pre>`;
+        return n.message
+          ? `<pre>${esc(n.message)}</pre>`
+          : `<span class="muted">Open the session to see what it asks.</span>`;
+      }
+      let seenNeeds = null;
+      function renderNeeds(s) {
+        const list = s.sessions
+          .filter(activeNeed)
+          .sort(
+            (a, b) =>
+              needRank(a) - needRank(b) ||
+              (a.statusSince || 0) - (b.statusSince || 0),
+          );
+        $("needs-wrap").hidden = !list.length;
+        $("needs-count").textContent = list.length;
+        document.title = list.length
+          ? `(${list.length}) needs you · Session Deck`
+          : "Session Deck";
+        let h = "";
+        for (const x of list) {
+          const n = activeNeed(x);
+          const id = esc(x.id);
+          const btns = x.attachable
+            ? `<button data-a="attach" data-id="${id}" class="primary">Open</button><button data-a="logs" data-id="${id}">Logs</button>`
+            : `<span class="small muted">answer in its terminal</span>`;
+          const dismiss =
+            n.kind === "reply"
+              ? `<button data-a="need-dismiss" data-id="${id}" title="Hide until its status changes again">Dismiss</button>`
+              : "";
+          h += `<div class="need"><div class="top"><span class="dot waiting"></span><b>${esc(x.name || x.sessionId)}</b><span class="chip warn">${esc(n.label)}</span><span class="small muted">${ago(x.statusSince)} · ${esc((x.worktree || {}).branch || "")}</span><span class="spacer"></span><div class="actions">${btns}${dismiss}</div></div><div class="detail">${needDetail(n)}</div></div>`;
+        }
+        $("needs").innerHTML = h;
+        notifyNew(list);
+      }
+      // A desktop alert for each new wait while the tab is in the background (after "Alert me").
+      function notifyNew(list) {
+        const keys = new Set(list.map(needKey));
+        if (
+          seenNeeds &&
+          document.hidden &&
+          window.Notification &&
+          Notification.permission === "granted"
+        )
+          for (const x of list)
+            if (!seenNeeds.has(needKey(x)))
+              try {
+                new Notification(`${x.name || x.id} needs you`, {
+                  body: activeNeed(x).label,
+                  tag: needKey(x),
+                });
+              } catch (_) {}
+        seenNeeds = keys;
+      }
+      if (window.Notification && Notification.permission === "default") {
+        $("btn-notify").hidden = false;
+        $("btn-notify").onclick = () =>
+          Notification.requestPermission().then(() => {
+            $("btn-notify").hidden = true;
+          });
+      }
+
+      function renderSessions(s) {
+        if (!s.sessions.length) {
+          $("sessions").innerHTML =
+            `<div class="empty">No running sessions.</div>`;
+          return;
+        }
+        let h = `<table><tr><th>Session</th><th>Branch</th><th>Ticket</th><th class="num">CPU</th><th class="num">Mem</th><th>Activity</th><th></th></tr>`;
+        for (const x of s.sessions
+          .slice()
+          .sort(
+            (a, b) =>
+              needRank(a) - needRank(b) ||
+              a.stopped - b.stopped ||
+              (b.lastActivity || 0) - (a.lastActivity || 0),
+          )) {
+          const w = x.worktree || {};
+          const t = x.ticket;
+          const branch = w.branch
+            ? `<span class="mono">${esc(w.branch)}</span>${w.dirty ? ` <span class="chip warn">${w.dirty} changed</span>` : ""}<div class="small muted">↑${esc(w.ahead)} ↓${esc(w.behind)} vs main</div>`
+            : `<span class="muted">—</span>`;
+          const ticket = t
+            ? `#${t.id} ${stateChip(t.state)}<div class="small muted">${esc(t.mode)} ${esc(t.components)}</div>`
+            : `<span class="muted">—</span>`;
+          const id = esc(x.id);
+          const ctrl = !x.attachable
+            ? `<span class="small muted" title="Started in a terminal; type there to talk to it">terminal session</span>`
+            : x.stopped
+              ? `<button data-a="attach" data-id="${id}" title="Wakes the session">Open</button><button data-a="logs" data-id="${id}">Logs</button><button data-a="rm" data-id="${id}" class="danger">Remove</button>`
+              : `<button data-a="attach" data-id="${id}" class="primary">Open</button><button data-a="logs" data-id="${id}">Logs</button><button data-a="stop" data-id="${id}">Stop</button><button data-a="rm" data-id="${id}" class="danger">Remove</button>`;
+          const need = activeNeed(x);
+          h += `<tr class="${need ? "needs" : ""}">
+      <td class="who"><span class="dot ${esc(x.status)}"></span><b>${esc(x.name || x.sessionId)}</b>${need ? ` <span class="chip warn">needs you: ${esc(need.label)}</span>` : ""}<div class="small muted">${esc(x.status)} ${ago(x.statusSince)} · ${esc(x.kind)} · up ${ago(x.startedAt)}</div></td>
+      <td>${branch}</td><td>${ticket}</td>
+      <td class="num">${x.cpu}%</td><td class="num">${gb(x.rss)}<div class="small muted">${x.procs} procs</div></td>
+      <td><div class="small">${ago(x.lastActivity)} ago</div><div class="last">${esc(x.last)}</div></td>
+      <td><div class="actions">${ctrl}</div></td></tr>`;
+        }
+        $("sessions").innerHTML = h + "</table>";
+      }
+
+      function renderQueue(s) {
+        const q = s.queue;
+        $("guards").innerHTML = q.guards
+          ? `<span class="chip ok">guards on</span>`
+          : `<span class="chip warn">guards off</span>`;
+        let h = "";
+        if (q.holds.length)
+          h += `<div class="pad">${q.holds.map((x) => `<div><span class="chip bad">HOLD ${esc(x.component)}</span> ${esc(x.reason)} <button data-a="allow-hold" data-c="${esc(x.component)}">Clear hold…</button></div>`).join("")}</div>`;
+        if (!q.tickets.length) h += `<div class="empty">No tickets yet.</div>`;
+        else {
+          h += `<table><tr><th>#</th><th>State</th><th>Branch</th><th>Mode</th><th>Detail</th><th>Age</th><th></th></tr>`;
+          for (const t of q.tickets.slice(0, 20)) {
+            const btns = [
+              `<button data-a="tlog" data-t="${t.id}">Log</button>`,
+            ];
+            if (t.state === "held")
+              btns.push(
+                `<button data-a="release" data-t="${t.id}">Release</button>`,
+              );
+            if (t.state === "blocked")
+              btns.push(
+                `<button data-a="allow-ticket" data-t="${t.id}">Allow…</button>`,
+              );
+            h += `<tr><td class="num">${t.id}</td><td>${stateChip(t.state)}</td><td class="mono">${esc(t.branch)}</td><td class="small">${esc(t.mode)} ${esc(t.components)}</td><td class="small">${esc(t.detail)}</td><td class="small muted">${ago(t.updated_at)}</td><td><div class="actions">${btns.join("")}</div></td></tr>`;
+          }
+          h += "</table>";
+        }
+        if (q.alerts.length)
+          h += `<div class="pad"><div class="small muted">Recent alerts</div><pre>${esc(q.alerts.slice(-6).join("\n"))}</pre></div>`;
+        $("queue").innerHTML = h;
+      }
+
+      function worktreeRows(list) {
+        let h = "";
+        for (const t of list) {
+          const st = t.main
+            ? `<span class="chip accent">main checkout</span>`
+            : `${t.dirty ? `<span class="chip warn">${t.dirty} changed</span>` : `<span class="chip">clean</span>`} ${t.merged ? `<span class="chip ok">merged</span>` : ""}`;
+          const can = !t.main && !t.dirty && t.merged && !t.sessions.length;
+          h += `<tr><td class="mono small">${esc(t.path.replace(/^\/home\/[^/]+/, "~"))}</td><td class="mono small">${esc(t.branch || "detached")}</td><td>${st}</td><td class="small">${esc(t.sessions.join(", "))}</td><td>${can ? `<button data-a="wt-rm" data-p="${esc(t.path)}">Remove</button>` : ""}</td></tr>`;
+        }
+        return h;
+      }
+      // The conductor's cleanup.json rows; a button carries only the id, the row is looked up here.
+      let CLEAN = {};
+      const CLEAN_VERB = {
+        session: "Remove",
+        worktree: "Remove",
+        tickets: "Cancel",
+        stray: "Delete",
+        debt: "Done",
+      };
+      function renderCleanup(s) {
+        const items = (s.cleanup && s.cleanup.items) || [];
+        CLEAN = Object.fromEntries(items.map((i) => [i.id, i]));
+        $("cleanup-wrap").hidden = !items.length;
+        $("cleanup-count").textContent = items.length || "";
+        let h = `<table><tr><th>Kind</th><th>What</th><th></th></tr>`;
+        for (const i of items) {
+          const why = i.stale
+            ? ` <span class="small muted">— not now: ${esc(i.stale)}</span>`
+            : "";
+          const btn = i.stale
+            ? ""
+            : `<button data-a="clean" data-id="${esc(i.id)}">${CLEAN_VERB[i.kind] || "Act"}</button>`;
+          h += `<tr><td class="small">${esc(i.kind)}</td><td class="small">${esc(i.label)}${why}</td><td>${btn}</td></tr>`;
+        }
+        $("cleanup").innerHTML = h + "</table>";
+      }
+      function cleanupDialog(id) {
+        const i = CLEAN[id];
+        if (!i || i.stale) return;
+        const plan = {
+          session: [
+            `Remove session ${i.name}?`,
+            `claude rm: the session and its worktree ${i.path}. It refuses unpushed commits.`,
+            "session_rm",
+            { id: i.sessionId },
+          ],
+          worktree: [
+            "Remove worktree?",
+            i.path,
+            "worktree_remove",
+            { path: i.path },
+          ],
+          tickets: [
+            "Cancel these tickets?",
+            `${(i.tickets || []).join(", ")}: marked cancelled; no code or branch is touched.`,
+            "ticket_cancel",
+            { id: i.id, tickets: i.tickets },
+          ],
+          stray: [
+            "Delete this stray folder?",
+            i.path,
+            "stray_rm",
+            { name: i.id.replace(/^stray:/, "") },
+          ],
+          debt: [
+            "Mark this debt done?",
+            i.label,
+            "debt_done",
+            { debt: i.debt },
+          ],
+        }[i.kind];
+        if (!plan) return;
+        const [title, text, action, body] = plan;
+        dialog(
+          title,
+          `<p>${esc(i.label)}</p><p class="small muted">${esc(text)}</p>`,
+          [
+            ["Cancel", "", () => $("dlg").close()],
+            [
+              "Confirm",
+              "primary",
+              async () => {
+                const r = await act(action, body);
+                showResult(
+                  r.results
+                    ? r.results
+                        .map(
+                          (x) =>
+                            `ticket ${x.ticket}: ${x.ok ? "cancelled" : x.output}`,
+                        )
+                        .join("\n")
+                    : r.output || r.error || "done",
+                );
+                refresh();
+              },
+            ],
+          ],
+        );
+      }
+      let showDone = false;
+      function renderWorktrees(s) {
+        // In use, dirty or unmerged first; clean merged ones are leftovers, folded away.
+        const done = s.worktrees.filter(
+          (t) => !t.main && !t.dirty && t.merged && !t.sessions.length,
+        );
+        const live = s.worktrees
+          .filter((t) => !done.includes(t))
+          .sort(
+            (a, b) =>
+              b.main - a.main ||
+              b.sessions.length - a.sessions.length ||
+              (b.dirty || 0) - (a.dirty || 0),
+          );
+        const head = `<table><tr><th>Path</th><th>Branch</th><th>State</th><th>Used by</th><th></th></tr>`;
+        let h = head + worktreeRows(live) + "</table>";
+        if (done.length)
+          h +=
+            `<div class="pad"><button data-a="wt-toggle">${showDone ? "Hide" : "Show"} ${done.length} clean, merged worktrees</button></div>` +
+            (showDone ? head + worktreeRows(done) + "</table>" : "");
+        $("worktrees").innerHTML = h;
+      }
+
+      function meter(label, pct, text, hot) {
+        return `<div>${label}</div><div><span class="small">${text}</span><div class="meter ${hot ? "hot" : ""}"><div style="width:${Math.min(100, Math.max(0, pct || 0))}%"></div></div></div>`;
+      }
+      function renderSystem(s) {
+        const y = s.system;
+        const usedPct = 100 - y.mem.availPct;
+        let h =
+          `<div class="kv">` +
+          meter(
+            "CPU",
+            y.cpu,
+            `${y.cpu ?? "…"}% of ${y.cores} cores · load ${y.load.join(" ")}`,
+            y.cpu > 90,
+          ) +
+          meter(
+            "Memory",
+            usedPct,
+            `${gb(y.mem.total - y.mem.available)} used · ${gb(y.mem.available)} free`,
+            y.mem.availPct < 15,
+          ) +
+          meter(
+            "Swap",
+            y.swap.usedPct,
+            `${y.swap.usedPct}% of ${gb(y.swap.total)}` +
+              (y.swap.holders.length
+                ? ` · ${y.swap.holders
+                    .slice(0, 3)
+                    .map((p) => `${esc(p.comm)} ${gb(p.swap)}`)
+                    .join(", ")}`
+                : ""),
+            y.swap.hot,
+          ) +
+          meter(
+            "Disk /",
+            100 - (100 * y.disk.free) / y.disk.total,
+            `${gb(y.disk.free)} free`,
+            y.disk.free / y.disk.total < 0.1,
+          ) +
+          `</div>`;
+        h += `<div class="pad">`;
+        if (y.swap.usedPct > 0 && !y.swap.hot)
+          h += `<div class="small muted" style="margin-bottom:6px" title="The kernel moves a page back only when a program touches it, so idle pages stay swapped out after the pressure that put them there is gone.">Swap holds idle pages and stays put while memory is free; it matters only when memory runs short too.</div>`;
+        for (const [k, l] of Object.entries(y.locks))
+          h += `<div>${k}: ${l.held ? `<span class="chip warn">held ${ago(l.since)}</span> <span class="small mono">${esc(l.holder)}</span>` : `<span class="chip">free</span>`}</div>`;
+        if (y.gate.tail.length)
+          h += `<details style="margin-top:8px"><summary class="small muted">Latest gate log · ${esc(y.gate.file.split("/").slice(-2).join("/"))}</summary><pre>${esc(y.gate.tail.join("\n"))}</pre></details>`;
+        h += `<div style="margin-top:8px" class="small muted">By program: ${y.groups.map((g) => `${esc(g.name)} ×${g.count} ${gb(g.rss)}`).join(" · ")}</div></div>`;
+        $("system").innerHTML = h;
+      }
+      function renderVps(s) {
+        const v = s.queue.vps;
+        if (v.configured === false) {
+          $("vps").innerHTML = `<div class="empty">This repository names no stamps command.</div>`;
+          return;
+        }
+        if (v.ok === null) {
+          $("vps").innerHTML = `<div class="empty">Reading production…</div>`;
+          return;
+        }
+        if (!v.ok) {
+          $("vps").innerHTML =
+            `<div class="empty">Production stamps unavailable (the stamps command failed).</div>`;
+          return;
+        }
+        let h = `<div class="kv">`;
+        for (const [k, sha] of Object.entries(v.stamps))
+          h += `<div>${k}</div><div class="mono">${esc(sha)}</div>`;
+        if (v.lease.length)
+          h += `<div>Lease</div><div class="small">${v.lease.length === 1 && v.lease[0] === "free" ? `<span class="chip">free</span>` : `<span class="chip warn">held</span> ${esc(v.lease.join(" "))}`}</div>`;
+        h += `</div>`;
+        $("vps").innerHTML =
+          h + `<div class="pad small muted">read ${v.age ?? "?"}s ago</div>`;
+      }
+      function renderProcs(s) {
+        let h = `<table><tr><th>Process</th><th class="num">Mem</th><th class="num">CPU</th><th></th></tr>`;
+        for (const p of s.system.top.slice(0, 12))
+          h += `<tr><td><span class="mono small">${p.pid}</span> <b>${esc(p.comm)}</b><div class="small muted last" title="${esc(p.cmd)}">${esc(p.cmd)}</div></td><td class="num">${gb(p.rss)}</td><td class="num">${p.cpu}%</td><td><button class="danger" data-a="kill" data-pid="${p.pid}">Stop…</button></td></tr>`;
+        $("procs").innerHTML = h + "</table>";
+      }
+
+      // ---- actions
+      document.body.addEventListener("click", async (ev) => {
+        const b = ev.target.closest("[data-a]");
+        if (!b) return;
+        ev.stopPropagation();
+        const a = b.dataset.a;
+        try {
+          if (a === "attach") return openTerminal(b.dataset.id);
+          if (a === "logs") return logsDialog(b.dataset.id);
+          if (a === "stop")
+            return confirmRun(
+              `Stop session ${b.dataset.id}?`,
+              "Its conversation and worktree are kept; Open wakes it again, Remove deletes it.",
+              "session_stop",
+              { id: b.dataset.id },
+            );
+          if (a === "rm")
+            return confirmRun(
+              `Remove session ${b.dataset.id}?`,
+              "Deletes the background session, and its worktree when that is safe.",
+              "session_rm",
+              { id: b.dataset.id },
+            );
+          if (a === "tlog")
+            return textDialog(
+              `Ticket ${b.dataset.t} log`,
+              (await act("ticket_log", { ticket: b.dataset.t })).output,
+            );
+          if (a === "release")
+            return confirmRun(
+              `Release ticket ${b.dataset.t}?`,
+              "Its commits may then ship with any deploy.",
+              "release",
+              { ticket: b.dataset.t },
+            );
+          if (a === "allow-ticket") return allowDialog(b.dataset.t, "");
+          if (a === "allow-hold") return allowDialog("hold", b.dataset.c);
+          if (a === "clean") return cleanupDialog(b.dataset.id);
+          if (a === "wt-rm")
+            return confirmRun(
+              "Remove worktree?",
+              b.dataset.p,
+              "worktree_remove",
+              { path: b.dataset.p },
+            );
+          if (a === "kill") return killDialog(Number(b.dataset.pid));
+          if (a === "need-dismiss") {
+            const x = S.sessions.find((y) => y.id === b.dataset.id);
+            if (x) dismissed[x.id] = needKey(x);
+            try {
+              localStorage.setItem(DISMISS_KEY, JSON.stringify(dismissed));
+            } catch (_) {}
+            return render();
+          }
+          if (a === "wt-toggle") {
+            showDone = !showDone;
+            return render();
+          }
+        } catch (e) {
+          toast(String(e.message || e));
+        }
+      });
+
+      // The session's own transcript: messages plus one line per tool call. `claude logs` (its
+      // screen repaint) reads as gibberish as text and overlaps when replayed at another size.
+      async function logsDialog(id) {
+        const r = await act("session_logs", { id });
+        const body = r.messages.length
+          ? r.messages
+              .map((m) =>
+                m.role === "tool"
+                  ? `<div class="msg tool"><pre>→ ${esc(m.text)}</pre></div>`
+                  : `<div class="msg ${esc(m.role)}"><div class="who">${esc(m.role)} <span class="muted">${m.at ? esc(new Date(m.at).toLocaleTimeString()) : ""}</span></div><pre>${esc(m.text)}</pre></div>`,
+              )
+              .join("")
+          : `<span class="muted">${r.found ? "Nothing yet." : "No transcript found for this session."}</span>`;
+        dialog(`Session log · ${id}`, body, [
+          ["Close", "", () => $("dlg").close()],
+        ]);
+        $("dlg").classList.add("wide");
+        const box = $("dlg-body");
+        box.scrollTop = box.scrollHeight; // newest at the bottom, like a terminal
+      }
+      $("dlg").addEventListener("close", () =>
+        $("dlg").classList.remove("wide"),
+      );
+
+      function confirmRun(title, text, action, body) {
+        dialog(title, `<p>${esc(text)}</p>`, [
+          ["Cancel", "", () => $("dlg").close()],
+          [
+            "Confirm",
+            "primary",
+            async () => {
+              const r = await act(action, body);
+              showResult(r.output || "done");
+              refresh();
+            },
+          ],
+        ]);
+      }
+
+      function allowDialog(target, comp) {
+        const comps = (S?.queue?.components || [])
+          .map((c) => `<option ${c === comp ? "selected" : ""}>${c}</option>`)
+          .join("");
+        dialog(
+          target === "hold"
+            ? `Clear the ${comp} hold`
+            : `Allow ticket ${target}`,
+          `<label>Commit, ticket number, "unstamped" or "hold"</label><input type="text" id="al-target" value="${esc(target)}">
+     <label>App</label><select id="al-comp">${comps}</select>
+     <label>Reason (recorded)</label><input type="text" id="al-reason" placeholder="Why this may ship">`,
+          [
+            ["Cancel", "", () => $("dlg").close()],
+            [
+              "Allow",
+              "primary",
+              async () => {
+                const r = await act("allow", {
+                  target: $("al-target").value.trim(),
+                  component: $("al-comp").value,
+                  reason: $("al-reason").value,
+                });
+                showResult(r.output);
+                refresh();
+              },
+            ],
+          ],
+        );
+      }
+
+      async function killDialog(pid) {
+        const p = await act("proc_info", { pid });
+        dialog(
+          `Stop process ${pid}?`,
+          `<div class="kv"><div>Program</div><div><b>${esc(p.comm)}</b></div><div>Command</div><div class="mono">${esc(p.cmd)}</div><div>Folder</div><div class="mono">${esc(p.cwd)}</div><div>Memory</div><div>${gb(p.rss)}</div></div><p class="small muted">Sends SIGTERM to this pid only.</p>`,
+          [
+            ["Cancel", "", () => $("dlg").close()],
+            [
+              "Stop it",
+              "primary",
+              async () => {
+                const r = await act("kill", { pid, start: p.start });
+                showResult(r.output);
+                refresh();
+              },
+            ],
+          ],
+        );
+      }
+
+      $("btn-new-session").onclick = () => {
+        dialog(
+          "New background session",
+          `<label>Name (also the worktree and branch)</label><input type="text" id="ns-name" placeholder="fix-login-redirect" autocomplete="off" spellcheck="false">
+     <div class="small muted" id="ns-branch">Branch: —</div>
+     <div class="row" style="margin-top:8px"><label><input type="checkbox" id="ns-wt" checked> Own worktree</label></div>
+     <div class="row"><label title="Runs superpowers:brainstorming: researches and asks you questions before it plans"><input type="checkbox" id="ns-bs" checked> Ask questions first</label></div>
+     <label>First instruction</label><textarea id="ns-prompt" placeholder="What should this session do?"></textarea>`,
+          [
+            ["Cancel", "", () => $("dlg").close()],
+            [
+              "Start",
+              "primary",
+              async () => {
+                const r = await act("session_start", {
+                  name: $("ns-name").value.replace(/-+$/, ""),
+                  prompt: $("ns-prompt").value,
+                  worktree: $("ns-wt").checked,
+                  brainstorm: $("ns-bs").checked,
+                });
+                showResult(r.output);
+                refresh();
+              },
+            ],
+          ],
+        );
+        // Spaces and other characters turn into dashes as you type: the name is a branch name.
+        const nameInput = $("ns-name");
+        nameInput.focus();
+        nameInput.addEventListener("input", () => {
+          const at = nameInput.selectionStart;
+          const before = nameInput.value;
+          const v = before
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-+/, "")
+            .slice(0, 40);
+          if (v !== before) {
+            nameInput.value = v;
+            const pos = Math.max(0, at - (before.length - v.length));
+            nameInput.setSelectionRange(pos, pos);
+          }
+          const final = v.replace(/-+$/, "");
+          $("ns-branch").textContent = final
+            ? `Branch: worktree-${final}`
+            : "Branch: —";
+        });
+      };
+
+      $("btn-submit").onclick = () => {
+        const opts = (S?.branches || [])
+          .map((b) => `<option>${esc(b)}</option>`)
+          .join("");
+        const waivers = (S?.queue?.waivers || [])
+          .map(
+            (w) =>
+              `<div class="row"><label style="width:150px"><input type="checkbox" data-w="${esc(w)}"> ${esc(w)}</label><input type="text" data-wr="${esc(w)}" placeholder="reason" style="flex:1"></div>`,
+          )
+          .join("") || `<div class="small muted">This repository names no waivers.</div>`;
+        const compBoxes = (S?.queue?.components || [])
+          .map((c) => `<label><input type="checkbox" data-c="${esc(c)}"> ${esc(c)}</label>`)
+          .join("");
+        dialog(
+          "Submit a branch to the release queue",
+          `<label>Branch</label><select id="sb-branch">${opts}</select>
+     <label>What happens after it merges</label>
+     <div class="row"><label><input type="radio" name="sb-mode" value="deploy" checked> Deploy</label><label><input type="radio" name="sb-mode" value="ride"> Merge, ride along</label><label><input type="radio" name="sb-mode" value="hold"> Merge, hold until released</label></div>
+     <label>Components to deploy</label>
+     <div class="row">${compBoxes}<label><input type="checkbox" id="sb-recreate"> --recreate</label></div>
+     <label>Gate waivers (each needs a reason)</label>${waivers}`,
+          [
+            ["Cancel", "", () => $("dlg").close()],
+            [
+              "Submit",
+              "primary",
+              async () => {
+                const body = $("dlg-body");
+                const waiversOut = {};
+                body.querySelectorAll("[data-w]").forEach((c) => {
+                  if (c.checked)
+                    waiversOut[c.dataset.w] = body.querySelector(
+                      `[data-wr="${c.dataset.w}"]`,
+                    ).value;
+                });
+                const r = await act("submit", {
+                  branch: $("sb-branch").value,
+                  mode: body.querySelector("[name=sb-mode]:checked").value,
+                  components: [
+                    ...body.querySelectorAll("[data-c]:checked"),
+                  ].map((c) => c.dataset.c),
+                  recreate: $("sb-recreate").checked,
+                  waivers: waiversOut,
+                });
+                showResult(r.output);
+                refresh();
+              },
+            ],
+          ],
+        );
+      };
+
+      // ---- terminal: always on the page. With no session open it shows the release queue
+      // (`sluicy status`, redrawn every 3 s, read-only); Open on a session swaps it in.
+      let term = null,
+        fit = null,
+        termId = null,
+        termSession = null, // null = the queue view
+        es = null,
+        gen = 0;
+      function teardown() {
+        if (
+          document.activeElement &&
+          $("term").contains(document.activeElement)
+        )
+          document.activeElement.blur();
+        if (es) es.close();
+        if (term) term.dispose();
+        term = fit = es = null;
+        termId = null;
+      }
+      function attach(key, title, session) {
+        teardown();
+        const mine = ++gen;
+        termId = key;
+        termSession = session;
+        $("term-title").textContent = title;
+        $("term-back").hidden = !session;
+        $("term-send-row").hidden = !session;
+        term = new Terminal({
+          fontSize: 13,
+          convertEol: false,
+          cursorBlink: !!session,
+          disableStdin: !session,
+          theme: { background: "#0d1117" },
+        });
+        fit = new FitAddon.FitAddon();
+        term.loadAddon(fit);
+        term.open($("term"));
+        fit.fit();
+        act("term_resize", {
+          term: key,
+          cols: term.cols,
+          rows: term.rows,
+        }).catch(() => {});
+        if (session)
+          // A disposed xterm can keep focus and still emit keys: only the current view may send.
+          term.onData(
+            (d) =>
+              mine === gen &&
+              act("term_input", { term: key, data: d }).catch((e) =>
+                toast(e.message),
+              ),
+          );
+        const src = new EventSource(
+          `/api/term/${key}/stream?t=${encodeURIComponent(TOKEN)}`,
+        );
+        es = src;
+        src.onmessage = (m) => {
+          if (m.data && mine === gen)
+            term.write(Uint8Array.from(atob(m.data), (c) => c.charCodeAt(0)));
+        };
+        src.addEventListener("closed", () => {
+          src.close();
+          if (mine !== gen) return;
+          if (session) term.write("\r\n[detached]\r\n");
+          // The status view ended (reaped while the tab was hidden, or watch exited): restart it.
+          else setTimeout(() => mine === gen && showQueue(), 3000);
+        });
+        // A dropped status stream (deck restarted, laptop slept) would freeze the view; reconnect.
+        src.onerror = () => {
+          if (!session && src.readyState === EventSource.CLOSED)
+            setTimeout(() => mine === gen && showQueue(), 5000);
+        };
+      }
+      async function showQueue() {
+        // Leaving a session's terminal ends its `claude attach` on the server too.
+        if (termSession && termId)
+          act("term_close", { term: termId }).catch(() => {});
+        try {
+          const r = await act("term_queue", {});
+          attach(r.term, "sluicy status", null);
+        } catch (e) {
+          teardown();
+          gen++;
+          termSession = null;
+          $("term-title").textContent = "sluicy status unavailable";
+          $("term-back").hidden = true;
+          $("term-send-row").hidden = true;
+        }
+      }
+      async function openTerminal(id) {
+        const r = await act("term_open", { id });
+        // Another session's terminal: close it on the server too, or its `claude attach` lingers.
+        // The queue view is left running; the reaper ends it if nobody comes back.
+        if (termSession && termId && termId !== r.term)
+          act("term_close", { term: termId }).catch(() => {});
+        attach(r.term, id, id);
+        $("term-wrap").scrollIntoView({ behavior: "smooth" });
+        term.focus();
+      }
+      $("term-back").onclick = () => showQueue();
+      async function sendLine() {
+        const v = $("term-line").value;
+        if (!v || !termId || !termSession) return;
+        await act("term_input", { term: termId, data: v + "\r" });
+        $("term-line").value = "";
+      }
+      $("term-send").onclick = sendLine;
+      $("term-line").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") sendLine();
+      });
+      window.addEventListener("resize", () => {
+        if (fit && termId) {
+          fit.fit();
+          act("term_resize", {
+            term: termId,
+            cols: term.cols,
+            rows: term.rows,
+          }).catch(() => {});
+        }
+      });
+      showQueue();
+
+      // ---- loop
+      let inFlight = false;
+      async function refresh() {
+        inFlight = true;
+        try {
+          S = await api("/api/state");
+          render();
+        } catch (e) {
+          $("meta").textContent = "deck unreachable: " + e.message;
+        } finally {
+          inFlight = false;
+        }
+      }
+      refresh();
+      // The timer never stacks requests: each refresh reads the repo, /proc and the sessions list.
+      // A hidden tab still refreshes every 15 s, so its title and alerts say when a session needs
+      // you. A refresh after an action still runs at once.
+      let ticks = 0;
+      setInterval(() => {
+        ticks++;
+        if ($("dlg").open || inFlight) return;
+        if (!document.hidden || ticks % 5 === 0) refresh();
+      }, 3000);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden && !inFlight) refresh();
+      });
+    </script>
+  </body>
+</html>

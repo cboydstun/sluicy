@@ -1,0 +1,79 @@
+# A monorepo deployed to a server by its own deploy script. Copy to `.sluicy.toml` at the repo root and edit.
+project = "acme"
+
+[repo]
+remote = "origin"
+branch = "main"
+
+# A component is a directory that deploys on its own. A branch that touches `api/` asks to deploy `api`.
+[components.api]
+path = "api"
+deploy_args = ["--api"]
+
+[components.web]
+path = "web"
+deploy_args = ["--web"]
+
+[deploy]
+kind = "command"
+# {args} expands to the deploy_args of every component the ticket deploys; {sha} is the exact merged commit.
+command = ["./deploy.sh", "{args}", "--sha", "{sha}", "--yes"]
+recreate_arg = "--recreate"
+# Run when a worker died mid-deploy and the stamps say the new build is live: proves it is healthy.
+smoke_command = ["./deploy.sh", "--smoke-only"]
+
+# Exit codes of the deploy command. 0 is live; any code not listed here is "unknown" and holds the components.
+[deploy.exit_codes]
+lease_busy = 10   # another deploy holds the server: try again in a minute
+refused = 11      # the deploy's own preflight said no; nothing changed
+build_failed = 12 # the build failed; the old build still serves
+rolled_back = 13  # it went live, failed its checks and was rolled back
+
+# Prints `name=<sha>` for each component name it is given: what production runs now. Without it, sluicy
+# remembers what it deployed itself.
+[stamps]
+command = ["bash", "scripts/read-stamps.sh"]
+
+[gate]
+# Variables a ticket may set to skip a check, with a reason. never_waive ones cannot be skipped on a requeue.
+waivers = ["DOCS_OK", "SKIP_E2E"]
+never_waive = ["SKIP_E2E"]
+# Variables never taken from whoever started the worker (plus anything starting with GATE_).
+strip_env = ["PLAYWRIGHT_WORKERS"]
+# Given to the gate on every queued push.
+env = { GATE_FAIL_FAST = "1" }
+# The gate is capped at min(75% of RAM, RAM - mem_reserve_gb).
+mem_reserve_gb = 6
+# How to find what failed in the gate's output, for the ticket's failure excerpt.
+red_line = '^\s*✗ '
+case_head = '^\s+\d+\) \[[\w-]+\] › '
+suite_head = '^(FAIL |\s+● (?!Console))'
+# A gate log line that means "stopped at the quick checks": only those failures take a waiver.
+quick_stop = ["Stopped early"]
+
+[preflight]
+# The fast checks, run on every queued ticket minutes after submit, beside a running gate.
+command = ["bash", "scripts/ci.sh"]
+env = { CI_QUICK = "1" }
+link_dirs = ["node_modules", "web/node_modules"]
+exclude = [".swc/"]
+
+# After a merge, a changed file matching a key runs that command in the file's directory.
+[deps]
+"package-lock.json" = ["npm", "ci", "--silent"]
+
+[init]
+copy_files = ["api/.env", "web/.env.local"]
+install = [{ dir = ".", command = ["npm", "ci", "--silent"] }]
+
+[guard]
+# A session running one of these directly is told to use the queue instead.
+deploy_patterns = ['(^|[\s;&|/])deploy\.sh\b']
+allow_args = ['--smoke-only']
+
+[hooks]
+# Runs after a deploy goes live, in the checkout; see SLUICY_* in the README.
+on_live = []
+
+[plan_review]
+enabled = true
