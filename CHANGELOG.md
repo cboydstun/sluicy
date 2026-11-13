@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-11-13
+
+- Code map: a ticket that landed before the map reached it (the usual case on a busy queue, since the map
+  waits for gates) is mapped at its own merge, `base_sha..merged_sha`, instead of showing 0 files. It no
+  longer needs the session's worktree. A ticket whose commit reached main through another ticket is marked
+  skipped once instead of being retried every conductor pass. Merged graphs are cached as the next ticket's
+  base.
+
 ## 0.2.0 - 2026-11-12
 
 - The code map, with [graphify](https://github.com/Graphify-Labs/graphify), off unless `[graph] enabled = true`:

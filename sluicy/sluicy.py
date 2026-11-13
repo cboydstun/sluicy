@@ -1164,7 +1164,7 @@ def cmd_preflight(_args):
 # ---- the code map (graphify, optional): impact, queue overlap and rules, after preflight, never in its way
 
 BUSY = ("merging", "pushing", "deploying")
-MAP_KEEP_BASES = 2
+MAP_KEEP_BASES = 4
 
 
 def map_dir():
@@ -1204,47 +1204,79 @@ def map_cache():
     return d
 
 
-def base_graph(root, base_sha, log):
-    """main's graph at base_sha, built once and cached (the newest MAP_KEEP_BASES are kept)."""
+def cache_graph(root, sha):
+    """Keep the graph now in the map tree as the graph of `sha` (the newest MAP_KEEP_BASES are kept)."""
     cache = map_cache()
-    path = cache / f"base-{base_sha}.json"
+    path = cache / f"base-{sha}.json"
+    tmp = path.with_suffix(".tmp")
+    shutil.copyfile(root / P.cfg["graph"]["out_dir"] / "graph.json", tmp)
+    tmp.replace(path)
+    for old in sorted(cache.glob("base-*.json"), key=lambda p: p.stat().st_mtime)[:-MAP_KEEP_BASES]:
+        old.unlink(missing_ok=True)
+    return path
+
+
+def base_graph(root, sha, log):
+    """The graph of commit `sha`, built once (checked out in the map tree) and cached."""
+    path = map_cache() / f"base-{sha}.json"
     if not path.exists():
+        git("checkout", "-q", "--detach", sha, cwd=root, log=log)
         why = sgraph.run(root, P.cfg["graph"], log, clean_env())
         if why:
             return None, why
-        tmp = path.with_suffix(".tmp")
-        shutil.copyfile(root / P.cfg["graph"]["out_dir"] / "graph.json", tmp)
-        tmp.replace(path)
-        for old in sorted(cache.glob("base-*.json"), key=lambda p: p.stat().st_mtime)[:-MAP_KEEP_BASES]:
-            old.unlink(missing_ok=True)
+        cache_graph(root, sha)
     return sgraph.load(path)
 
 
+def commit_exists(sha, root):
+    return bool(sha) and git("cat-file", "-e", f"{sha}^{{commit}}", cwd=root, check=False).returncode == 0
+
+
+def in_main(sha, root):
+    return commit_exists(sha, root) and git("merge-base", "--is-ancestor", sha, P.main_ref, cwd=root, check=False).returncode == 0
+
+
 def map_one(conn, t, root):
-    """Build the graph of main and of the ticket merged onto it; store the ticket's impact. Never changes
-    the ticket's state: a missing map is only a missing line in `status`."""
+    """Store the ticket's impact: the graph of what it changes against the graph before it. A ticket that
+    landed is mapped at its own merge (base_sha..merged_sha), whatever main has become since; a pending one
+    is merged onto main here. Never changes the ticket's state: a missing map is only a missing line."""
     gcfg = P.cfg["graph"]
     logp = home() / "logs" / f"{t['id']}.map.log"
     logp.parent.mkdir(parents=True, exist_ok=True)
     with logp.open("w") as log:
         git("fetch", "-q", P.remote, P.branch, cwd=root, log=log)
-        git("checkout", "-q", "--detach", P.main_ref, cwd=root, log=log)
-        git("reset", "-q", "--hard", P.main_ref, cwd=root, log=log)
-        base_sha = git("rev-parse", "HEAD", cwd=root)
-        base, why = base_graph(root, base_sha, log)
-        if not base:
-            log.write(f"no graph of main: {why}\n")
-            return False
-        fetched = git("fetch", "-q", t["source"], f"refs/heads/{t['branch']}", cwd=root, check=False, log=log)
-        if fetched.returncode != 0 or git("merge-base", "--is-ancestor", t["sha"], "FETCH_HEAD", cwd=root, check=False).returncode != 0:
-            log.write("could not fetch the ticket's commit\n")
-            return False
+        landed = bool(t["base_sha"]) and in_main(t["merged_sha"], root) and commit_exists(t["base_sha"], root)
+        if not landed and in_main(t["sha"], root):
+            # In main, but not through this ticket's own merge (another ticket carried it): nothing to map.
+            imp = {"files": [], "skipped": "already in main through another ticket"}
+            log.write(imp["skipped"] + "\n")
+            set_ticket(conn, t["id"], impact=json.dumps(imp), impact_sha=t["sha"])
+            return True
         try:
-            merged = git("merge", "--no-ff", "--no-commit", t["sha"], cwd=root, check=False, log=log)
-            if merged.returncode != 0:
-                log.write("does not merge onto main; no map\n")
-                return False
-            files = [f for f in git("diff", "--cached", "--name-only", cwd=root).splitlines() if f]
+            if landed:
+                base_sha = t["base_sha"]
+                base, why = base_graph(root, base_sha, log)
+                if not base:
+                    log.write(f"no graph of {base_sha[:10]}: {why}\n")
+                    return False
+                git("checkout", "-q", "--detach", t["merged_sha"], cwd=root, log=log)
+                files = [f for f in git("diff", "--name-only", base_sha, t["merged_sha"], cwd=root).splitlines() if f]
+            else:
+                base_sha = git("rev-parse", P.main_ref, cwd=root)
+                base, why = base_graph(root, base_sha, log)
+                if not base:
+                    log.write(f"no graph of main: {why}\n")
+                    return False
+                git("checkout", "-q", "--detach", base_sha, cwd=root, log=log)
+                fetched = git("fetch", "-q", t["source"], f"refs/heads/{t['branch']}", cwd=root, check=False, log=log)
+                if fetched.returncode != 0 or git("merge-base", "--is-ancestor", t["sha"], "FETCH_HEAD", cwd=root, check=False).returncode != 0:
+                    log.write("could not fetch the ticket's commit\n")
+                    return False
+                merged = git("merge", "--no-ff", "--no-commit", t["sha"], cwd=root, check=False, log=log)
+                if merged.returncode != 0:
+                    log.write("does not merge onto main; no map\n")
+                    return False
+                files = [f for f in git("diff", "--cached", "--name-only", cwd=root).splitlines() if f]
             why = sgraph.run(root, gcfg, log, clean_env())
             if why:
                 log.write(f"{why}\n")
@@ -1253,10 +1285,13 @@ def map_one(conn, t, root):
             if not g:
                 log.write(f"{why}\n")
                 return False
+            if landed:
+                cache_graph(root, t["merged_sha"])  # the next ticket's base, in a chain of merges
             imp = sgraph.impact(g, files, gcfg["rules"], base)
             imp["base_sha"] = base_sha
         finally:
             git("merge", "--abort", cwd=root, check=False)
+            git("checkout", "-q", "--detach", P.main_ref, cwd=root, check=False)
             git("reset", "-q", "--hard", P.main_ref, cwd=root, check=False)
         log.write(sgraph.summary(imp) + "\n")
     set_ticket(conn, t["id"], impact=json.dumps(imp), impact_sha=t["sha"])
