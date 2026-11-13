@@ -2278,6 +2278,65 @@ class CodeMap(Base):
         self.assertNotIn("graphify-out", self.alerts())
         self.assertTrue((self.root / "checkout" / "graphify-out" / "graph.json").exists())
 
+    def map_tree_head(self):
+        tree = self.root / "checkout-map"
+        return self.git(tree, "rev-parse", "HEAD"), self.git(tree, "status", "--porcelain")
+
+    def test_landed_ticket_maps_its_own_merge(self):
+        tid = self.submit("feat/landed", "--deploy", "web")
+        self.run_worker()  # lands before the map ever runs, as on a busy queue
+        t = self.ticket(tid)
+        self.assertEqual(t["state"], "live")
+        self.direct_push("api/file.txt")  # main moves on after the ticket landed
+        res = self.sy("map")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        t = self.ticket(tid)
+        self.assertEqual(t["impact"]["files"], ["web/file.txt"])
+        self.assertEqual(t["impact"]["base_sha"], t["base_sha"])
+        base = json.loads((self.root / "state" / "maps" / "proj" / f"base-{t['base_sha']}.json").read_text())
+        self.assertIn("web/file.txt", {n["source_file"] for n in base["nodes"]})
+        self.assertTrue((self.root / "state" / "maps" / "proj" / f"base-{t['merged_sha']}.json").exists())
+        self.assertEqual(self.map_tree_head(), (self.origin_main(), ""))
+
+    def test_landed_ticket_maps_after_its_worktree_is_gone(self):
+        tid = self.submit("feat/gone", "--deploy", "web")
+        self.run_worker()
+        with sqlite3.connect(self.root / "state" / "sluicy.db") as conn:
+            conn.execute("UPDATE tickets SET source = ? WHERE id = ?", (str(self.root / "deleted-worktree"), int(tid)))
+        self.sy("map")
+        self.assertEqual(self.ticket(tid)["impact"]["files"], ["web/file.txt"])
+
+    def test_failed_gate_with_an_unpushed_merge_maps_as_pending(self):
+        (self.ctl / "gate-red").write_text("")
+        tid = self.submit("feat/redgate", "--deploy", "web")
+        self.run_worker()
+        t = self.ticket(tid)
+        self.assertEqual(t["state"], "failed")
+        self.assertTrue(t["merged_sha"])  # kept, never pushed
+        self.sy("map")
+        self.assertEqual(self.ticket(tid)["impact"]["files"], ["web/file.txt"])
+
+    def test_already_in_main_another_way_is_marked_once(self):
+        sha = self.branch("feat/twin")
+        tid = self.sy("submit", "--branch", "feat/twin", "--ride", check=True).stdout.split()[1]
+        self.git(self.dev, "push", "-q", "--no-verify", "origin", f"{sha}:main")
+        self.sy("preflight")
+        self.sy("map")
+        t = self.ticket(tid)
+        self.assertEqual(t["impact"]["skipped"], "already in main through another ticket")
+        self.assertIn("map: skipped", self.sy("status", tid).stdout)
+        self.assertEqual(self.count("graphify.log"), 0)
+        self.sy("map")
+        self.assertEqual(self.count("graphify.log"), 0)  # no longer a candidate
+
+    def test_tree_is_back_on_main_after_a_graphify_error(self):
+        (self.ctl / "graphify-fail").write_text("")
+        tid = self.submit("feat/err", "--deploy", "web")
+        self.run_worker()
+        self.sy("map")
+        self.assertIsNone(self.ticket(tid)["impact"])
+        self.assertEqual(self.map_tree_head(), (self.origin_main(), ""))
+
     def test_red_note_names_the_map(self):
         (self.ctl / "gate-red").write_text("")
         tid = self.submit("feat/red", "--deploy", "web")

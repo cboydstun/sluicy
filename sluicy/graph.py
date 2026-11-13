@@ -209,6 +209,8 @@ def summary(imp):
     """One line for `status` and `wait`."""
     if not imp:
         return "map: none yet"
+    if imp.get("skipped"):
+        return f"map: skipped ({imp['skipped']})"
     names = [c["name"] for c in imp.get("communities", [])]
     parts = [f"{len(imp.get('files', []))} file(s)", f"{len(names)} area(s)" + (f" ({', '.join(names[:3])}{', …' if len(names) > 3 else ''})" if names else "")]
     if imp.get("god_nodes"):
@@ -225,6 +227,8 @@ def brief(t, imp, graph_path):
     head = f"# Review brief: ticket {t['id']} ({t['branch']} at {t['sha'][:10]})\n"
     if not imp:
         return head + "\nNo code map yet. It is built after preflight, when graphify is installed and `[graph] enabled = true`.\n"
+    if imp.get("skipped"):
+        return head + f"\nNo code map: {imp['skipped']}.\n"
     lines = [head, summary(imp), "", "## Files changed"]
     lines += [f"- `{f}`" for f in imp["files"][:60]] + ([f"- … {len(imp['files']) - 60} more"] if len(imp["files"]) > 60 else [])
     lines += ["", f"{imp['mapped_files']} of them are in the graph ({imp['nodes']} symbols); "
