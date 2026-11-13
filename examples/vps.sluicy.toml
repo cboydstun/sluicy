@@ -77,3 +77,16 @@ on_live = []
 
 [plan_review]
 enabled = true
+
+# The code map (needs graphify on PATH: `uv tool install graphifyy`). Off unless enabled. See the README.
+[graph]
+enabled = false
+# update_args = ["update", ".", "--force"]
+# timeout_s = 600
+# min_avail_gb = 4
+
+# Reported (never enforced) when a ticket adds a dependency from `from` to `to`.
+[[graph.rules]]
+name = "web-not-api-internals"
+from = ["web/*"]
+to = ["api/src/*"]

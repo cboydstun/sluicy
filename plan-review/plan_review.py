@@ -86,24 +86,38 @@ def plan_candidates(tool_input, state):
     return texts
 
 
+OFF = {"enabled": False, "focus": "", "graph": ""}
+
+
 def repo_settings(cwd):
-    """(enabled, focus) from the nearest `.sluicy.toml` above `cwd`. No file, or a broken one: off."""
+    """{enabled, focus, graph} from the nearest `.sluicy.toml` above `cwd`. No file, or a broken one: off.
+    `graph` is the repository's graphify graph.json when the project turned the code map on and one exists."""
     if sluicy_config is None:
-        return False, ""  # cannot read repo settings: never gate a repo that did not ask for it
+        return dict(OFF)  # cannot read repo settings: never gate a repo that did not ask for it
     f = sluicy_config.find(cwd or os.getcwd(), stop="/")
     if not f:
-        return False, ""
+        return dict(OFF)
     try:
-        pr = sluicy_config.load(f)["plan_review"]
+        cfg = sluicy_config.load(f)
     except sluicy_config.ConfigError:
-        return False, ""
-    return pr["enabled"], pr["focus"]
+        return dict(OFF)
+    graph = ""
+    if cfg["graph"]["enabled"]:
+        candidate = Path(f).parent / cfg["graph"]["out_dir"] / "graph.json"
+        graph = str(candidate) if candidate.is_file() else ""
+    return {"enabled": cfg["plan_review"]["enabled"], "focus": cfg["plan_review"]["focus"], "graph": graph}
 
 
-def instructions(session, plan_file, focus=""):
+def instructions(session, plan_file, focus="", graph=""):
     plan_arg = plan_file or "<the plan file in ~/.claude/plans/>"
     me = Path(__file__).resolve()
     extra = f"\n     This project also asks Reviewer B to check: {focus}" if focus else ""
+    if graph:
+        report = Path(graph).parent / "GRAPH_REPORT.md"
+        extra += (f"\n   - Both: this repository has a code map (graphify). Check what calls or depends on what with\n"
+                  f"     `graphify explain \"<symbol>\" --graph {graph}`, `graphify path \"<A>\" \"<B>\" --graph {graph}` and\n"
+                  f"     `graphify affected \"<symbol>\" --graph {graph}`; Reviewer B reads {report} for the hubs and\n"
+                  f"     areas the plan touches. The map can be stale or miss an edge: confirm in the code.")
     return f"""Plan-review gate: this plan has not had an adversarial review, so it cannot leave plan mode yet.
 
 Do this, then call ExitPlanMode again:
@@ -135,8 +149,8 @@ def hook():
         return 0
     if data.get("tool_name") != "ExitPlanMode" or gate_off():
         return 0
-    enabled, focus = repo_settings(data.get("cwd"))
-    if not enabled:
+    settings = repo_settings(data.get("cwd"))
+    if not settings["enabled"]:
         return 0
     session = data.get("session_id") or "unknown"
     tool_input = data.get("tool_input") or {}
@@ -144,7 +158,8 @@ def hook():
     recorded = state.get("planHash")
     if recorded and any(digest(t) == recorded for t in plan_candidates(tool_input, state)):
         return 0
-    reason = instructions(session, tool_input.get("planFilePath") or state.get("planFile"), focus)
+    reason = instructions(session, tool_input.get("planFilePath") or state.get("planFile"), settings["focus"],
+                          settings["graph"])
     if recorded:
         reason = "The plan changed since its review was recorded.\n\n" + reason
     print(json.dumps({

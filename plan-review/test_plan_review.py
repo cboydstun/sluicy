@@ -72,6 +72,15 @@ class GateTest(unittest.TestCase):
         self.assertIn("the mobile builds in the stores", reason)
         self.assertIn(str(Path(plan_review.__file__).resolve()), reason)
 
+    def test_code_map_reaches_the_reviewers_when_built(self):
+        (self.repo / ".sluicy.toml").write_text('project = "p"\n[plan_review]\nenabled = true\n[graph]\nenabled = true\n')
+        self.assertNotIn("code map", self.assertDenied(self.run_hook(self.exit_payload())))  # not built yet
+        (self.repo / "graphify-out").mkdir()
+        (self.repo / "graphify-out" / "graph.json").write_text("{}")
+        reason = self.assertDenied(self.run_hook(self.exit_payload()))
+        self.assertIn(f"graphify explain \"<symbol>\" --graph {self.repo / 'graphify-out' / 'graph.json'}", reason)
+        self.assertIn("GRAPH_REPORT.md", reason)
+
     def test_unreviewed_plan_is_denied_with_instructions(self):
         reason = self.assertDenied(self.run_hook(self.exit_payload()))
         self.assertIn("Reviewer A", reason)

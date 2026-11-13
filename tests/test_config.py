@@ -63,6 +63,31 @@ class Validate(unittest.TestCase):
     def test_env_values_are_strings(self):
         self.bad('project = "x"\n[gate]\nenv = { A = 1 }', "string values")
 
+    def test_graph_defaults_off(self):
+        g = self.ok('project = "x"')["graph"]
+        self.assertFalse(g["enabled"])
+        self.assertEqual(g["command"], ["graphify"])
+        self.assertEqual(g["rules"], [])
+
+    def test_graph_rules(self):
+        cfg = self.ok('project = "x"\n[graph]\nenabled = true\n[[graph.rules]]\nname = "web-not-api"\n'
+                      'from = ["web/**"]\nto = ["api/src/**"]')
+        self.assertEqual(cfg["graph"]["rules"][0]["to"], ["api/src/**"])
+        self.bad('project = "x"\n[[graph.rules]]\nname = "a"\nfrom = ["w/**"]', "graph.rules.a.to")
+        self.bad('project = "x"\n[[graph.rules]]\nname = "a"\nfrom = ["w"]\nto = ["a"]\nenforce = true', "unknown key 'enforce'")
+        self.bad('project = "x"\n[[graph.rules]]\nfrom = ["w"]\nto = ["a"]', "unique short `name`")
+        self.bad('project = "x"\n[[graph.rules]]\nname = "a"\nfrom = ["w"]\nto = ["a"]\n'
+                 '[[graph.rules]]\nname = "a"\nfrom = ["w"]\nto = ["a"]', "unique short `name`")
+        self.bad('project = "x"\n[graph]\nrules = { a = 1 }', "a list of [[graph.rules]]")
+
+    def test_graph_values(self):
+        self.bad('project = "x"\n[graph]\nenabled = "yes"', "graph.enabled")
+        self.bad('project = "x"\n[graph]\nout_dir = "../out"', "graph.out_dir")
+        self.bad('project = "x"\n[graph]\nout_dir = "/tmp/out"', "graph.out_dir")
+        self.bad('project = "x"\n[graph]\ntimeout_s = 0', "graph.timeout_s")
+        self.bad('project = "x"\n[graph]\ncommand = []', "graph.command")
+        self.bad('project = "x"\n[graph]\ngraphh = 1', "unknown key 'graphh'")
+
     def test_examples_are_valid(self):
         for f in sorted((ROOT / "examples").glob("*.toml")):
             with self.subTest(f.name):
