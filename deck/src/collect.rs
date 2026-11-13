@@ -952,12 +952,46 @@ fn vps_state(c: &Cfg) -> Value {
     d
 }
 
+/// The code map's impact (sluicy's `impact` column, JSON) as a few words for the queue's Map column, or "".
+/// The full impact (every area's files) stays out of the page: `sluicy review <id>` prints it.
+pub fn map_summary(impact: &Value, current: bool) -> String {
+    let Some(text) = impact.as_str() else {
+        return String::new();
+    };
+    let Ok(imp) = serde_json::from_str::<Value>(text) else {
+        return String::new();
+    };
+    let count = |k: &str| imp[k].as_array().map(|a| a.len()).unwrap_or(0);
+    let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    let mut parts = vec![plural(count("files"), "file"), plural(count("communities"), "area")];
+    if count("god_nodes") > 0 {
+        parts.push(plural(count("god_nodes"), "hub"));
+    }
+    let hits: usize = imp["rule_hits"]
+        .as_object()
+        .map(|o| o.values().map(|v| v.as_array().map(|a| a.len()).unwrap_or(0)).sum())
+        .unwrap_or(0);
+    if hits > 0 {
+        parts.push(plural(hits, "rule hit"));
+    }
+    let mut out = parts.join(" · ");
+    if !current {
+        out.push_str(" (older commit)");
+    }
+    out
+}
+
 pub fn collect_queue(c: &Cfg) -> Value {
     let mut tickets = vec![];
     let mut holds = vec![];
     if let Some(conn) = sluicy_db(c) {
         tickets = rows(&conn, "SELECT * FROM tickets ORDER BY id DESC LIMIT 40");
         holds = rows(&conn, "SELECT * FROM holds WHERE cleared_at IS NULL");
+    }
+    for t in tickets.iter_mut() {
+        let current = t.get("impact_sha").is_some() && t.get("impact_sha") == t.get("sha");
+        let map = t.remove("impact").map(|v| map_summary(&v, current)).unwrap_or_default();
+        t.insert("map".into(), json!(map));
     }
     let alerts_path = c.sluicy_home.join("alerts.log");
     let alerts: Vec<String> = if alerts_path.is_file() {
@@ -1272,6 +1306,17 @@ pub fn local_branches(c: &Cfg, memo: &mut GitMemo) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_summary_reads_the_impact_column() {
+        let imp = json!({"files": ["a", "b"], "communities": [{"name": "web"}], "god_nodes": [],
+                         "rule_hits": {"web-not-api": [["a", "x"]]}})
+        .to_string();
+        assert_eq!(map_summary(&json!(imp), true), "2 files · 1 area · 1 rule hit");
+        assert_eq!(map_summary(&json!(imp), false), "2 files · 1 area · 1 rule hit (older commit)");
+        assert_eq!(map_summary(&Value::Null, true), "");
+        assert_eq!(map_summary(&json!("{bad"), true), "");
+    }
 
     fn tail(pending: Value) -> Tail {
         Tail {

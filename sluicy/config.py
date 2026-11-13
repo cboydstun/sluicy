@@ -48,6 +48,16 @@ DEFAULTS = {
     "hooks": {"on_live": []},
     "plan_review": {"enabled": False, "focus": ""},
     "deck": {"lease_command": []},
+    # The code map (graphify, optional): impact, queue overlap, dependency rules, review briefs.
+    "graph": {
+        "enabled": False,
+        "command": ["graphify"],
+        "update_args": ["update", ".", "--force"],
+        "out_dir": "graphify-out",
+        "timeout_s": 600,
+        "min_avail_gb": 4.0,
+        "rules": [],
+    },
 }
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -162,7 +172,41 @@ def validate(raw, path="<config>"):
     if not isinstance(cfg["plan_review"]["focus"], str):
         raise ConfigError("plan_review.focus: text for the second reviewer")
     _strings(cfg["deck"]["lease_command"], "deck.lease_command")
+    _validate_graph(cfg["graph"])
     return cfg
+
+
+GLOB_KEYS = ("from", "to")
+
+
+def _validate_graph(g):
+    if not isinstance(g["enabled"], bool):
+        raise ConfigError("graph.enabled: true or false")
+    _strings(g["command"], "graph.command")
+    if not g["command"]:
+        raise ConfigError("graph.command: the graphify command, e.g. [\"graphify\"]")
+    _strings(g["update_args"], "graph.update_args")
+    out = g["out_dir"]
+    if not isinstance(out, str) or not out.strip("/") or ".." in Path(out).parts or out.startswith("/"):
+        raise ConfigError("graph.out_dir: a directory inside the repository")
+    g["out_dir"] = out.strip("/")
+    for key in ("timeout_s", "min_avail_gb"):
+        if isinstance(g[key], bool) or not isinstance(g[key], (int, float)) or g[key] <= 0:
+            raise ConfigError(f"graph.{key}: a positive number")
+    if not isinstance(g["rules"], list) or not all(isinstance(r, dict) for r in g["rules"]):
+        raise ConfigError("graph.rules: a list of [[graph.rules]] tables")
+    names = set()
+    for rule in g["rules"]:
+        extra = set(rule) - {"name", *GLOB_KEYS}
+        if extra:
+            raise ConfigError(f"graph.rules: unknown key {sorted(extra)[0]!r}")
+        if not isinstance(rule.get("name"), str) or not NAME.match(rule["name"]) or rule["name"] in names:
+            raise ConfigError("graph.rules: each rule needs a unique short `name`")
+        names.add(rule["name"])
+        for key in GLOB_KEYS:
+            if not rule.get(key):
+                raise ConfigError(f"graph.rules.{rule['name']}.{key}: a list of path globs")
+            _strings(rule[key], f"graph.rules.{rule['name']}.{key}")
 
 
 def load(path):

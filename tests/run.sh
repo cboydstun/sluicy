@@ -5,6 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 run() { echo "== $*"; "$@"; }
 run python3 tests/test_config.py
+run python3 tests/test_graph.py
 run python3 tests/test_install.py
 run python3 plan-review/test_plan_review.py
 run python3 tests/test_sluicy.py

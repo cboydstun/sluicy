@@ -139,6 +139,10 @@ class DeckTest(unittest.TestCase):
         conn.execute(
             "INSERT INTO tickets (project, branch, sha, source, mode, components, state, created_at, updated_at) VALUES ('proj','fix/dirty','x','y','deploy','web','blocked',1,1)"
         )
+        conn.execute(
+            "UPDATE tickets SET impact = ?, impact_sha = 'x' WHERE id = 1",
+            (json.dumps({"files": ["web/a.ts"], "communities": [{"name": "web", "files": ["web/a.ts"] * 50}], "god_nodes": [], "rule_hits": {}}),),
+        )
         conn.commit()
         (cls.sy_home / "logs").mkdir()
         (cls.sy_home / "logs" / "1.log").write_text("\x1b[0;32mgate ok\x1b[0m\n")
@@ -280,6 +284,8 @@ class DeckTest(unittest.TestCase):
     def test_queue_system_worktrees(self):
         st = self.state()
         self.assertEqual(st["queue"]["tickets"][0]["branch"], "fix/dirty")
+        self.assertEqual(st["queue"]["tickets"][0]["map"], "1 file · 1 area")
+        self.assertNotIn("impact", st["queue"]["tickets"][0])  # the full map stays out of the page
         self.assertIn("ticket 1 blocked", st["queue"]["alerts"][0])
         sys_ = st["system"]
         self.assertIn("Only", sys_["warnings"][0])

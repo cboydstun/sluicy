@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as sconfig  # noqa: E402
+import graph as sgraph  # noqa: E402
 import platform_linux as plat  # noqa: E402
 
 KEEPALIVE = "ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=60"
@@ -160,7 +161,8 @@ def db():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tickets)")}
     for col, decl in (("push_pgid", "INTEGER"), ("submitted_by", "TEXT NOT NULL DEFAULT 'hand'"),
                       ("preflight_sha", "TEXT"), ("preflight_at", "REAL"), ("waived_by", "TEXT NOT NULL DEFAULT '{}'"),
-                      ("failure", "TEXT NOT NULL DEFAULT ''"), ("notes", "TEXT NOT NULL DEFAULT ''")):
+                      ("failure", "TEXT NOT NULL DEFAULT ''"), ("notes", "TEXT NOT NULL DEFAULT ''"),
+                      ("impact", "TEXT"), ("impact_sha", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {decl}")
             conn.commit()
@@ -225,6 +227,7 @@ def clean_env(extra=None):
 
 WORKER_UNIT = "sluicy-worker"
 PREFLIGHT_UNIT = "sluicy-preflight"
+MAP_UNIT = "sluicy-map"
 
 
 def worker_script():
@@ -237,6 +240,10 @@ def spawn_worker():
 
 def spawn_preflight():
     spawn("preflight", PREFLIGHT_UNIT, "preflight.out")
+
+
+def spawn_map():
+    spawn("map", MAP_UNIT, "map.out")
 
 
 def spawn(cmd, unit, outname):
@@ -1029,22 +1036,28 @@ def ensure_preflight_tree():
         git("worktree", "prune")
         git("worktree", "add", "-q", "--detach", str(root), P.main_ref)
     # `node_modules/` in .gitignore matches directories only, and these are symlinks.
-    exclude = Path(git("rev-parse", "--git-common-dir")) / "info" / "exclude"
-    if not exclude.is_absolute():
-        exclude = checkout() / exclude
-    exclude.parent.mkdir(parents=True, exist_ok=True)
     pf = P.cfg["preflight"]
     links = pf["link_dirs"]
-    have = exclude.read_text().split() if exclude.exists() else []
-    missing = [p for p in [*{Path(d).name for d in links}, *pf["exclude"]] if p not in have]
-    if missing:
-        with exclude.open("a") as f:
-            f.write("\n" + "\n".join(missing) + "\n")
+    exclude_paths([*{Path(d).name for d in links}, *pf["exclude"]])
     for rel in links:
         src, dst = checkout() / rel, root / rel
         if src.is_dir() and dst.parent.is_dir() and not dst.exists() and not dst.is_symlink():
             dst.symlink_to(src)
     return root
+
+
+def exclude_paths(paths):
+    """Add paths to the repository's shared `info/exclude` (every worktree of the checkout reads it), so the
+    stray mover and the gate's formatters leave them alone."""
+    exclude = Path(git("rev-parse", "--git-common-dir")) / "info" / "exclude"
+    if not exclude.is_absolute():
+        exclude = checkout() / exclude
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    have = exclude.read_text().split() if exclude.exists() else []
+    missing = [p for p in dict.fromkeys(paths) if p and p not in have]
+    if missing:
+        with exclude.open("a") as f:
+            f.write("\n" + "\n".join(missing) + "\n")
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -1128,6 +1141,11 @@ def cmd_preflight(_args):
             "SELECT * FROM tickets WHERE state = 'queued' AND (preflight_sha IS NULL OR preflight_sha != sha) ORDER BY id"
         ).fetchone()
         if not t:
+            try:
+                if wants_map(conn):
+                    spawn_map()
+            except Exception as err:  # noqa: BLE001 - the map is advice
+                print(f"code map: {err}", file=sys.stderr)
             run_conduct_quietly()
             return 0
         try:
@@ -1141,6 +1159,222 @@ def cmd_preflight(_args):
             with (home() / "logs" / f"{t['id']}.preflight.log").open("a") as log:
                 log.write(f"preflight error: {type(err).__name__}: {err}\n")
             mark_preflighted(conn, t)
+
+
+# ---- the code map (graphify, optional): impact, queue overlap and rules, after preflight, never in its way
+
+BUSY = ("merging", "pushing", "deploying")
+MAP_KEEP_BASES = 2
+
+
+def map_dir():
+    return Path(os.environ.get("SLUICY_MAP_DIR") or f"{checkout()}-map")
+
+
+def ensure_map_tree():
+    """A third detached worktree, only for graphify: the map's merges never touch the trees the worker or the
+    preflight use. Its out_dir is excluded so the stray mover never takes the graph's cache."""
+    root = map_dir()
+    if not root.is_dir():
+        git("worktree", "prune")
+        git("worktree", "add", "-q", "--detach", str(root), P.main_ref)
+    exclude_paths([P.cfg["graph"]["out_dir"]])
+    return root
+
+
+def gate_busy(conn):
+    """A gate, merge or deploy runs somewhere on the machine: the map waits for the next pass."""
+    marks = ",".join("?" * len(BUSY))
+    return conn.execute(f"SELECT 1 FROM tickets WHERE state IN ({marks}) LIMIT 1", BUSY).fetchone() is not None
+
+
+def map_room(conn):
+    """(ok, why): the map runs only on a quiet machine, so it can never compete with a gate."""
+    if gate_busy(conn):
+        return False, "a gate is running"
+    m = read_memory()
+    if m["avail_gb"] < float(P.cfg["graph"]["min_avail_gb"]) or stalling(m):
+        return False, f"not enough memory ({describe(m)})"
+    return True, ""
+
+
+def map_cache():
+    d = home() / "maps" / P.name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def base_graph(root, base_sha, log):
+    """main's graph at base_sha, built once and cached (the newest MAP_KEEP_BASES are kept)."""
+    cache = map_cache()
+    path = cache / f"base-{base_sha}.json"
+    if not path.exists():
+        why = sgraph.run(root, P.cfg["graph"], log, clean_env())
+        if why:
+            return None, why
+        tmp = path.with_suffix(".tmp")
+        shutil.copyfile(root / P.cfg["graph"]["out_dir"] / "graph.json", tmp)
+        tmp.replace(path)
+        for old in sorted(cache.glob("base-*.json"), key=lambda p: p.stat().st_mtime)[:-MAP_KEEP_BASES]:
+            old.unlink(missing_ok=True)
+    return sgraph.load(path)
+
+
+def map_one(conn, t, root):
+    """Build the graph of main and of the ticket merged onto it; store the ticket's impact. Never changes
+    the ticket's state: a missing map is only a missing line in `status`."""
+    gcfg = P.cfg["graph"]
+    logp = home() / "logs" / f"{t['id']}.map.log"
+    logp.parent.mkdir(parents=True, exist_ok=True)
+    with logp.open("w") as log:
+        git("fetch", "-q", P.remote, P.branch, cwd=root, log=log)
+        git("checkout", "-q", "--detach", P.main_ref, cwd=root, log=log)
+        git("reset", "-q", "--hard", P.main_ref, cwd=root, log=log)
+        base_sha = git("rev-parse", "HEAD", cwd=root)
+        base, why = base_graph(root, base_sha, log)
+        if not base:
+            log.write(f"no graph of main: {why}\n")
+            return False
+        fetched = git("fetch", "-q", t["source"], f"refs/heads/{t['branch']}", cwd=root, check=False, log=log)
+        if fetched.returncode != 0 or git("merge-base", "--is-ancestor", t["sha"], "FETCH_HEAD", cwd=root, check=False).returncode != 0:
+            log.write("could not fetch the ticket's commit\n")
+            return False
+        try:
+            merged = git("merge", "--no-ff", "--no-commit", t["sha"], cwd=root, check=False, log=log)
+            if merged.returncode != 0:
+                log.write("does not merge onto main; no map\n")
+                return False
+            files = [f for f in git("diff", "--cached", "--name-only", cwd=root).splitlines() if f]
+            why = sgraph.run(root, gcfg, log, clean_env())
+            if why:
+                log.write(f"{why}\n")
+                return False
+            g, why = sgraph.load(root / gcfg["out_dir"] / "graph.json")
+            if not g:
+                log.write(f"{why}\n")
+                return False
+            imp = sgraph.impact(g, files, gcfg["rules"], base)
+            imp["base_sha"] = base_sha
+        finally:
+            git("merge", "--abort", cwd=root, check=False)
+            git("reset", "-q", "--hard", P.main_ref, cwd=root, check=False)
+        log.write(sgraph.summary(imp) + "\n")
+    set_ticket(conn, t["id"], impact=json.dumps(imp), impact_sha=t["sha"])
+    note_overlaps(conn, get_ticket(conn, t["id"]), imp)
+    return True
+
+
+def note_overlaps(conn, t, imp):
+    """One note on the newer of two active tickets whose areas meet, once per pair."""
+    if t["state"] not in ACTIVE:
+        return
+    marks = ",".join("?" * len(ACTIVE))
+    others = conn.execute(f"SELECT * FROM tickets WHERE project = ? AND id != ? AND state IN ({marks}) AND impact IS NOT NULL",
+                          (t["project"], t["id"], *ACTIVE)).fetchall()
+    for o in others:
+        try:
+            shared = sgraph.overlap(imp, json.loads(o["impact"]))
+        except ValueError:
+            continue
+        if not shared:
+            continue
+        older, newer = sorted((t, o), key=lambda r: r["id"])
+        newer = get_ticket(conn, newer["id"])
+        tag = f"Code map: shares an area with ticket {older['id']} ({older['branch']})"
+        if tag in (newer["notes"] or ""):
+            continue
+        listed = ", ".join(shared[:8]) + (f" and {len(shared) - 8} more" if len(shared) > 8 else "")
+        add_note(conn, newer, f"{tag}: {listed}. The queue merges {older['id']} first; if it lands, rerun the "
+                 f"checks for these files. `sluicy review {newer['id']}` shows both sides.")
+
+
+def map_line(t):
+    """The ticket's impact as one line, or "" when it has none."""
+    try:
+        return sgraph.summary(json.loads(t["impact"])) if t["impact"] else ""
+    except (ValueError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def map_candidates(conn, since):
+    """Tickets without a map at their sha: queued and preflighted first, then recent finished ones (their
+    review brief and the conductor's note use it)."""
+    return conn.execute(
+        "SELECT * FROM tickets WHERE (impact_sha IS NULL OR impact_sha != sha) AND created_at > ? "
+        "AND state NOT IN ('superseded', 'cancelled', 'conflict', 'merging', 'pushing', 'deploying') "
+        "AND (state != 'queued' OR preflight_sha = sha) "
+        "ORDER BY CASE state WHEN 'queued' THEN 0 ELSE 1 END, id", (since,)).fetchall()
+
+
+def cmd_map(_args):
+    """Build the code map for tickets that lack one, while the machine is quiet. Started after every
+    preflight pass and by the conductor; one at a time. Exits on the first sign of a gate or low memory."""
+    home().mkdir(parents=True, exist_ok=True)
+    lock = (home() / "map.lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    conn = db()
+    tried = set()
+    while True:
+        rows = [t for t in map_candidates(conn, time.time() - 2 * 86400) if t["id"] not in tried]
+        if not rows:
+            return 0
+        t = rows[0]
+        tried.add(t["id"])
+        try:
+            use_project(conn, t["project"])
+            if not sgraph.available(P.cfg["graph"])[0] or not checkout().is_dir():
+                continue
+            ok, why = map_room(conn)
+            if not ok:
+                print(f"code map paused: {why}")
+                return 0
+            map_one(conn, t, ensure_map_tree())
+        except Exception as err:  # noqa: BLE001 - the map is advice; it must never stop anything
+            with (home() / "logs" / f"{t['id']}.map.log").open("a") as log:
+                log.write(f"map error: {type(err).__name__}: {err}\n")
+
+
+def wants_map(conn):
+    """A project with the map on has a ticket without one (the conductor then starts `sluicy map`)."""
+    for t in map_candidates(conn, time.time() - 2 * 86400):
+        try:
+            use_project(conn, t["project"])
+        except Exception:  # noqa: BLE001
+            continue
+        if sgraph.available(P.cfg["graph"])[0]:
+            return True
+    return False
+
+
+def cmd_review(args):
+    """The ticket's review brief: what it touches, new rule hits, hubs and graphify commands to dig in."""
+    conn = db()
+    t = get_ticket(conn, args.ticket)
+    if not t:
+        die(f"no ticket {args.ticket}", 3)
+    imp = None
+    if t["impact"]:
+        try:
+            imp = json.loads(t["impact"])
+        except ValueError:
+            imp = None
+    if args.json:
+        print(json.dumps({"ticket": t["id"], "sha": t["sha"], "impact_sha": t["impact_sha"], "impact": imp}))
+        return 0
+    try:
+        use_project(conn, t["project"])
+        base = map_cache() / f"base-{(imp or {}).get('base_sha', '')}.json"
+        graph_path = str(base if base.is_file() else map_dir() / P.cfg["graph"]["out_dir"] / "graph.json")
+    except Exception:  # noqa: BLE001 - a brief without the path is still a brief
+        graph_path = "graphify-out/graph.json"
+    text = sgraph.brief(t, imp, graph_path)
+    if imp and t["impact_sha"] != t["sha"]:
+        text += f"\nNote: this map is of {t['impact_sha'][:10]}, an older commit of the ticket.\n"
+    print(text, end="")
+    return 0
 
 
 # ---- requeue: a person or the conductor sends a failed ticket round again, on the record
@@ -1378,10 +1612,10 @@ def conduct_tickets(conn, state, sessions, now):
                 add_note(conn, t, f"Infrastructure failure ({t['detail'][:120]}); not requeued again (cap or memory). A person decides.")
                 alert(f"ticket {t['id']} ({t['branch']}): infrastructure failure, requeue cap reached")
         elif kind == "quick":
-            add_note(conn, t, P.cfg["gate"]["quick_note"] + "\n" + (t["failure"] or t["detail"]))
+            add_note(conn, t, P.cfg["gate"]["quick_note"] + "\n" + (t["failure"] or t["detail"]) + map_hint(t))
         elif kind == "real":
             add_note(conn, t, "The gate failed past the quick checks; fix the failures below on your branch and commit:\n"
-                     + (t["failure"] or f"see {t['log_path']}"))
+                     + (t["failure"] or f"see {t['log_path']}") + map_hint(t))
         elif kind == "conflict":
             add_note(conn, t, "Does not merge onto main. Merge origin/main into your branch, keep both sides, rerun "
                      "the affected checks and submit again.\n" + (t["failure"] or ""))
@@ -1391,6 +1625,11 @@ def conduct_tickets(conn, state, sessions, now):
         acted.append(key)
     state["done"] = sorted(done)[-2000:]
     return acted
+
+
+def map_hint(t):
+    line = map_line(t)
+    return f"\n{line} (`sluicy review {t['id']}` for the brief)" if line else ""
 
 
 def memory_ok():
@@ -1694,6 +1933,11 @@ def cmd_conduct(_args):
     sessions = agents()
     jobs = job_sessions()
     acted = conduct_tickets(conn, state, sessions, now) + conduct_hogs(conn, state, sessions)
+    try:
+        if wants_map(conn):
+            spawn_map()
+    except Exception as err:  # noqa: BLE001 - the map is advice
+        print(f"code map: {err}", file=sys.stderr)
     items = cleanup_candidates(conn, sessions, now, jobs)
     items = auto_clean(conn, state, items, sessions, now)
     out = home() / "cleanup.json"
@@ -1898,14 +2142,23 @@ def cmd_status(args):
         if not t:
             die(f"no ticket {args.ticket}", 3)
         if args.json:
-            print(json.dumps(as_dict(t)))
+            d = as_dict(t)
+            try:
+                d["impact"] = json.loads(t["impact"]) if t["impact"] else None
+            except ValueError:
+                d["impact"] = None
+            print(json.dumps(d))
         else:
             for k, v in as_dict(t).items():
-                print(f"{k}: {v}")
+                if k != "impact":
+                    print(f"{k}: {v}")
+            if map_line(t):
+                print(map_line(t))
         return 0
     where, params = ("WHERE project = ?", (args.project,)) if args.project else ("", ())
     for t in conn.execute(f"SELECT * FROM tickets {where} ORDER BY id DESC LIMIT 30", params):
         pf = "pf✓ " if t["state"] == "queued" and t["preflight_sha"] == t["sha"] else ""
+        pf += "map✓ " if t["impact"] and t["impact_sha"] == t["sha"] else ""
         print(f"{t['id']:>4} {t['project'][:14]:<14} {t['state']:<12} {t['mode']:<7} {t['components']:<18} "
               f"{pf}{t['branch']}  {t['detail'][:90]}")
     for h in conn.execute(f"SELECT * FROM holds {where.replace('WHERE', 'WHERE cleared_at IS NULL AND') or 'WHERE cleared_at IS NULL'}", params):
@@ -1932,6 +2185,8 @@ def cmd_wait(args):
             print(f"ticket {t['id']}: {t['state']} {t['detail']}".rstrip())
             if t["failure"]:
                 print(f"failure:\n{t['failure']}")
+            if map_line(t):
+                print(map_line(t))
             if t["notes"]:
                 print(f"note from the sluicy conductor (not the user):\n{t['notes']}")
             if t["state"] in ENDED:
@@ -2467,6 +2722,12 @@ def main():
     s.set_defaults(fn=cmd_autoship)
     s = sub.add_parser("preflight", help="quick checks on queued tickets (started for you)")
     s.set_defaults(fn=cmd_preflight)
+    s = sub.add_parser("map", help="build the code map (graphify) for tickets without one (started for you)")
+    s.set_defaults(fn=cmd_map)
+    s = sub.add_parser("review", help="a ticket's review brief from the code map")
+    s.add_argument("ticket", type=int)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_review)
     s = sub.add_parser("requeue", help="send a failed ticket round again, on the record")
     s.add_argument("ticket", type=int)
     s.add_argument("--waive", action="append")

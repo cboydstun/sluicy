@@ -829,7 +829,8 @@
           h += `<div class="pad">${q.holds.map((x) => `<div><span class="chip bad">HOLD ${esc(x.component)}</span> ${esc(x.reason)} <button data-a="allow-hold" data-c="${esc(x.component)}">Clear hold…</button></div>`).join("")}</div>`;
         if (!q.tickets.length) h += `<div class="empty">No tickets yet.</div>`;
         else {
-          h += `<table><tr><th>#</th><th>State</th><th>Branch</th><th>Mode</th><th>Detail</th><th>Age</th><th></th></tr>`;
+          const showMap = q.tickets.some((t) => t.map);
+          h += `<table><tr><th>#</th><th>State</th><th>Branch</th><th>Mode</th>${showMap ? "<th>Map</th>" : ""}<th>Detail</th><th>Age</th><th></th></tr>`;
           for (const t of q.tickets.slice(0, 20)) {
             const btns = [
               `<button data-a="tlog" data-t="${t.id}">Log</button>`,
@@ -842,7 +843,7 @@
               btns.push(
                 `<button data-a="allow-ticket" data-t="${t.id}">Allow…</button>`,
               );
-            h += `<tr><td class="num">${t.id}</td><td>${stateChip(t.state)}</td><td class="mono">${esc(t.branch)}</td><td class="small">${esc(t.mode)} ${esc(t.components)}</td><td class="small">${esc(t.detail)}</td><td class="small muted">${ago(t.updated_at)}</td><td><div class="actions">${btns.join("")}</div></td></tr>`;
+            h += `<tr><td class="num">${t.id}</td><td>${stateChip(t.state)}</td><td class="mono">${esc(t.branch)}</td><td class="small">${esc(t.mode)} ${esc(t.components)}</td>${showMap ? `<td class="small" title="sluicy review ${t.id}">${esc(t.map || "")}</td>` : ""}<td class="small">${esc(t.detail)}</td><td class="small muted">${ago(t.updated_at)}</td><td><div class="actions">${btns.join("")}</div></td></tr>`;
           }
           h += "</table>";
         }

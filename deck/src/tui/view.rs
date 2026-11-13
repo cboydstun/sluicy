@@ -554,8 +554,16 @@ fn draw_lower(f: &mut Frame, app: &App, st: &Value, area: Rect) {
                 head.push("apps");
             }
             widths.push(Constraint::Length(branch_w));
+            let show_map = w >= 120 && tickets.iter().any(|t| !s(t, "map").is_empty());
+            if show_map {
+                widths.push(Constraint::Length(24));
+            }
             widths.push(Constraint::Min(10));
-            head.extend(["branch", "detail"]);
+            head.push("branch");
+            if show_map {
+                head.push("map");
+            }
+            head.push("detail");
             let rows: Vec<Row> = tickets
                 .iter()
                 .map(|t| {
@@ -575,6 +583,9 @@ fn draw_lower(f: &mut Frame, app: &App, st: &Value, area: Rect) {
                         cells.push(Cell::from(s(t, "components").to_string()));
                     }
                     cells.push(Cell::from(short(s(t, "branch"), branch_w as usize)));
+                    if show_map {
+                        cells.push(Cell::from(short(s(t, "map"), 24)));
+                    }
                     cells.push(Cell::from(Span::styled(s(t, "detail").to_string(), DIM)));
                     Row::new(cells)
                 })

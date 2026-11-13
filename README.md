@@ -23,6 +23,8 @@ It comes with:
   - *plan review*, which asks for two adversarial reviewer subagents before a plan leaves plan mode.
 - **Session Deck** (`deck`): a terminal (or local web) dashboard of every Claude session, what needs
   you, the queue, memory and worktrees.
+- **the code map** (optional, with [graphify](https://github.com/Graphify-Labs/graphify)): what each
+  ticket touches, which queued tickets meet, new dependencies your rules forbid, and a review brief.
 
 sluicy is standard-library Python (3.11+) plus one Rust binary for the deck. It has no daemon and no
 server: the worker starts when there is work and exits when the queue is empty.
@@ -123,6 +125,7 @@ Everything except `project` is optional, and an unknown key is an error.
 | `[hooks]`      | `on_live`: a command run after a deploy goes live.                                                             |
 | `[plan_review]`| `enabled`, `focus` (extra things for the second reviewer to check).                                            |
 | `[deck]`       | `lease_command`: what the deck's Production panel shows as the deploy lease.                                    |
+| `[graph]`      | The code map: `enabled`, `command`, `update_args`, `out_dir`, `timeout_s`, `min_avail_gb`, `[[graph.rules]]`. See [Code map](#code-map-graphify). |
 
 ### The deploy contract
 
@@ -183,6 +186,59 @@ Optional environment:
 - `DECK_LOCKS="gate=/tmp/my-gate.lock;e2e=/tmp/e2e.lock"` names flock files to show;
 - `DECK_SLUICY` points at a sluicy other than the one on PATH.
 
+## Code map (graphify)
+
+[graphify](https://github.com/Graphify-Labs/graphify) turns a repository into a graph of its code: files,
+symbols, calls and imports, grouped into communities ("areas"). With `[graph] enabled = true` and
+`graphify` on PATH (`uv tool install graphifyy`), sluicy uses it to give you a view of every ticket on its
+way through the queue:
+
+- **Impact.** After a ticket's preflight, `sluicy map` (started for you) merges it onto main in a worktree
+  of its own, updates the graph and stores what it touches: files, areas, the most connected symbols
+  ("hubs") and how many files sit one edge away. `sluicy status <id>`, `sluicy wait` and the Deck's Map
+  column show it.
+- **Overlap.** When two queued tickets of one project meet in the same area, the newer one gets a note
+  naming the shared files, once.
+- **Rules.** `[[graph.rules]]` says "files matching `from` must not depend on files matching `to`"
+  (fnmatch globs; `*` crosses `/`). A ticket is reported when it **adds** such an edge: the edge is in
+  the merged graph and not in main's, so old violations in a file you touch are not yours. Rules report;
+  they never fail a ticket.
+- **Review brief.** `sluicy review <id>` prints the impact, new rule hits, the hubs touched and the
+  graphify commands to dig further (`explain`, `path`, `affected`). Give it to a reviewer agent or read it
+  yourself. A red ticket's conductor note carries the map line too.
+- **Plan review.** When the repository has a graph, the reviewers are told to check the plan's claims
+  about what calls what with graphify.
+
+```toml
+[graph]
+enabled = true
+
+[[graph.rules]]
+name = "web-not-api-internals"
+from = ["web/*"]
+to = ["api/src/*"]
+```
+
+**It stays out of the way.** The map runs after the preflight verdict, never inside it, and only on a
+quiet machine: it waits while any gate, merge or deploy runs, or while free memory is under
+`min_avail_gb` (4). graphify is killed with its whole process group after `timeout_s` (600). If graphify
+is missing, fails or writes a graph sluicy cannot read, the ticket simply has no map. main's graph is built
+once per main commit and cached in `~/.local/state/sluicy/maps/`; `out_dir` is added to the repository's
+`info/exclude` so the stray mover never takes it.
+
+**Privacy.** sluicy runs only graphify's local code pass (`update`, tree-sitter). It sets
+`GRAPHIFY_BACKEND=none` and removes LLM credentials (`*_API_KEY`, `ANTHROPIC_*`, `OPENAI_*`, …) from
+graphify's environment, so no code leaves the machine. graphify skips gitignored files, so keep secrets
+ignored.
+
+Out of scope: Graphify Cloud (its formal verification and hosted review are not used), graphify's MCP
+server and its LLM passes. Measured on a 32k-symbol monorepo: about 80 s for the first graph, 35 s per
+incremental update, under 1 GB.
+
+**Upgrading.** sluicy 0.1.0 refuses unknown keys, so install 0.2.0 on every machine that reads the
+repository before you add `[graph]` to its `.sluicy.toml`. On 0.1.0 the queue would refuse the config and
+plan review would switch itself off.
+
 ## Plan review
 
 With `[plan_review] enabled = true`, a session cannot leave plan mode until two reviewer subagents have
@@ -195,7 +251,7 @@ plan's exact text. Switch it off with `PLAN_REVIEW=off` or `touch ~/.local/state
 | Path                               | What                                                                 |
 | ---------------------------------- | -------------------------------------------------------------------- |
 | `~/.local/state/sluicy/`           | `sluicy.db`, per-ticket logs, `alerts.log`, `cleanup.json`, switches |
-| `~/.local/share/sluicy/checkouts/` | one permanent checkout per project, plus `<name>-preflight`          |
+| `~/.local/share/sluicy/checkouts/` | one permanent checkout per project, plus `<name>-preflight` and `<name>-map` |
 | `~/.config/systemd/user/`          | `sluicy-conduct.{service,timer}`, `sluicy-gate.slice`                |
 
 ## Tests

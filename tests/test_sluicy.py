@@ -2114,5 +2114,179 @@ class GuardRegex(unittest.TestCase):
         self.assertIsNone(self.mod.refusal("./deploy.sh --smoke-only", self.cfg))
 
 
+FAKE_GRAPHIFY = r'''#!/usr/bin/env python3
+# Fake graphify: one node per file, community = top-level directory, and an edge for each "dep: <path>" line.
+import json, os, sys
+ctl = os.environ["SY_CTL"]
+with open(os.path.join(ctl, "graphify.log"), "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+with open(os.path.join(ctl, "graphify-env.log"), "a") as f:
+    f.write(" ".join(sorted(os.environ)) + "\n")
+if os.path.exists(os.path.join(ctl, "graphify-fail")):
+    sys.exit(2)
+nodes, links = [], []
+for top, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in (".git", "graphify-out", "node_modules")]
+    for name in files:
+        path = os.path.relpath(os.path.join(top, name), ".")
+        area = path.split("/")[0] if "/" in path else "root"
+        nodes.append({"id": path, "label": path, "source_file": path, "community": area, "community_name": area,
+                      "file_type": "code"})
+        try:
+            text = open(path).read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            if line.startswith("dep: "):
+                links.append({"source": path, "target": line[5:].strip(), "relation": "imports_from",
+                              "confidence": "EXTRACTED", "source_file": path})
+os.makedirs("graphify-out", exist_ok=True)
+json.dump({"directed": False, "graph": {"schema_version": 1}, "nodes": nodes, "links": links},
+          open("graphify-out/graph.json", "w"))
+'''
+
+GRAPH_TOML = """
+[graph]
+enabled = true
+update_args = ["update", "."]
+timeout_s = 20
+
+[[graph.rules]]
+name = "web-not-api"
+from = ["web/*"]
+to = ["api/*"]
+"""
+
+
+class CodeMap(Base):
+    EXTRA_TOML = GRAPH_TOML
+
+    def setUp(self):
+        super().setUp()
+        write_exec(self.root / "bin" / "graphify", FAKE_GRAPHIFY)
+
+    def mapped(self, tid, env=None):
+        self.assertEqual(self.sy("preflight", env=env).returncode, 0)
+        res = self.sy("map", env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return self.ticket(tid)
+
+    def test_impact_status_review_and_wait(self):
+        tid = self.submit("feat/web", "--deploy", "web")
+        t = self.mapped(tid)
+        imp = t["impact"]
+        self.assertEqual(t["impact_sha"], t["sha"])
+        self.assertEqual(imp["files"], ["web/file.txt"])
+        self.assertEqual([c["name"] for c in imp["communities"]], ["web"])
+        self.assertEqual(t["state"], "queued")  # the map never moves a ticket
+        self.assertIn("map: 1 file(s); 1 area(s) (web)", self.sy("status", tid).stdout)
+        self.assertIn("map✓", self.sy("status").stdout)
+        brief = self.sy("review", tid, check=True).stdout
+        self.assertIn(f"Review brief: ticket {tid}", brief)
+        self.assertIn("`web/file.txt`", brief)
+        self.run_worker()
+        self.assertIn("map: 1 file(s)", self.sy("wait", tid, "--timeout", "1").stdout)
+        self.assertEqual(self.count("graphify.log"), 2)  # main once (cached), then the merge
+        tid2 = self.submit("feat/web2", "--deploy", "web", path="web/other.txt")
+        self.mapped(tid2)
+        self.assertEqual(self.count("graphify.log"), 4)  # main moved: a new base graph
+
+    def test_new_rule_hit_is_reported_not_enforced(self):
+        self.branch("feat/dep", "web/file.txt")
+        with (self.dev / "web" / "file.txt").open("a") as f:
+            f.write("dep: api/file.txt\n")
+        self.git(self.dev, "commit", "-qam", "web depends on api")
+        tid = self.sy("submit", "--branch", "feat/dep", "--ride", check=True).stdout.split()[1]
+        t = self.mapped(tid)
+        self.assertEqual(t["impact"]["rule_hits"], {"web-not-api": [["web/file.txt", "api/file.txt"]]})
+        self.assertIn("1 new rule hit(s): web-not-api", self.sy("status", tid).stdout)
+        self.run_worker()
+        self.assertEqual(self.state(tid), "merged")
+
+    def test_overlap_notes_the_newer_ticket_once(self):
+        a = self.submit("feat/a", "--deploy", "web")
+        self.branch("feat/b", "web/b.txt")
+        b = self.sy("submit", "--branch", "feat/b", "--deploy", "web", check=True).stdout.split()[1]
+        c = self.submit("feat/c", "--deploy", "api", path="api/c.txt")
+        self.mapped(a)
+        notes = self.ticket(b)["notes"]
+        self.assertIn(f"shares an area with ticket {a} (feat/a)", notes)
+        self.assertIn("web/file.txt", notes)
+        self.assertEqual(self.ticket(a)["notes"], "")
+        self.assertNotIn("shares an area", self.ticket(c)["notes"])
+        with sqlite3.connect(self.root / "state" / "sluicy.db") as conn:
+            conn.execute("UPDATE tickets SET impact_sha = NULL")
+        self.sy("map")
+        self.assertEqual(self.ticket(b)["notes"].count("shares an area"), 1)
+
+    def test_no_graphify_changes_nothing(self):
+        (self.root / "bin" / "graphify").unlink()
+        # and no real graphify from the machine's PATH either
+        path = ":".join(d for d in self.env["PATH"].split(":") if not (Path(d) / "graphify").exists())
+        tid = self.submit("feat/plain", "--deploy", "web")
+        t = self.mapped(tid, env={"PATH": path})
+        self.assertIsNone(t["impact"])
+        self.assertIn("No code map yet", self.sy("review", tid).stdout)
+        self.run_worker()
+        self.assertEqual(self.state(tid), "live")
+
+    def test_failing_graphify_is_only_a_log_line(self):
+        (self.ctl / "graphify-fail").write_text("")
+        tid = self.submit("feat/fail", "--deploy", "web")
+        t = self.mapped(tid)
+        self.assertIsNone(t["impact"])
+        self.assertIn("graphify exited 2", (self.root / "state" / "logs" / f"{tid}.map.log").read_text())
+        self.run_worker()
+        self.assertEqual(self.state(tid), "live")
+
+    def test_waits_for_a_quiet_machine(self):
+        tid = self.submit("feat/busy", "--deploy", "web")
+        self.sy("preflight")
+        with sqlite3.connect(self.root / "state" / "sluicy.db") as conn:
+            conn.execute("INSERT INTO tickets (branch, sha, source, mode, state, created_at, updated_at, project) "
+                         "VALUES ('x', 'x', 'x', 'ride', 'pushing', 0, 0, 'proj')")
+        self.assertIn("a gate is running", self.sy("map").stdout)
+        with sqlite3.connect(self.root / "state" / "sluicy.db") as conn:
+            conn.execute("DELETE FROM tickets WHERE branch = 'x'")
+        self.set_memory(1)
+        self.assertIn("not enough memory", self.sy("map").stdout)
+        self.assertEqual(self.count("graphify.log"), 0)
+        self.set_memory(64)
+        self.sy("map")
+        self.assertIsNotNone(self.ticket(tid)["impact"])
+
+    def test_graphify_gets_no_llm_credentials(self):
+        tid = self.submit("feat/env", "--deploy", "web")
+        self.sy("preflight")
+        self.sy("map", env={"ANTHROPIC_API_KEY": "sk-x", "OPENAI_API_KEY": "sk-y"})
+        self.assertIsNotNone(self.ticket(tid)["impact"])
+        env = (self.ctl / "graphify-env.log").read_text()
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertIn("GRAPHIFY_BACKEND", env)
+
+    def test_the_graph_cache_is_never_a_stray(self):
+        tid = self.submit("feat/cache", "--deploy", "web")
+        self.mapped(tid)
+        self.assertTrue((self.root / "checkout-map" / "graphify-out" / "graph.json").exists())
+        exclude = (self.root / "checkout" / ".git" / "info" / "exclude").read_text()
+        self.assertIn("graphify-out", exclude)
+        (self.root / "checkout" / "graphify-out").mkdir()
+        (self.root / "checkout" / "graphify-out" / "graph.json").write_text("{}")
+        self.run_worker()
+        self.assertEqual(self.state(tid), "live")
+        self.assertNotIn("graphify-out", self.alerts())
+        self.assertTrue((self.root / "checkout" / "graphify-out" / "graph.json").exists())
+
+    def test_red_note_names_the_map(self):
+        (self.ctl / "gate-red").write_text("")
+        tid = self.submit("feat/red", "--deploy", "web")
+        self.mapped(tid)
+        self.run_worker()
+        self.assertEqual(self.state(tid), "failed")
+        self.sy("conduct")
+        self.assertIn(f"map: 1 file(s); 1 area(s) (web) (`sluicy review {tid}`", self.ticket(tid)["notes"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
