@@ -46,8 +46,9 @@ impl Terminal {
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                // macOS takes *mut termios/winsize, Linux *const; null_mut() coerces to both.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         };
         if rc != 0 {
