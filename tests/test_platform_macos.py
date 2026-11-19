@@ -21,7 +21,7 @@ def runner(outputs):
 
     def run(argv):
         calls.append(argv)
-        cmd = " ".join(argv)
+        cmd = " ".join([Path(argv[0]).name, *argv[1:]])
         for key, out in outputs.items():
             if cmd.startswith(key):
                 if isinstance(out, Exception):
@@ -80,6 +80,17 @@ class Memory(unittest.TestCase):
         self.assertEqual((m["some"], m["full"]), (0.0, 0.0))
 
 
+@unittest.skipUnless(sys.platform == "darwin", "macOS only: the real commands")
+class RealCommands(unittest.TestCase):
+    def test_readers_work_without_sbin_on_path(self):
+        # sluicy's worker runs with a cleaned env, and /usr/sbin (sysctl, lsof) is not on its PATH.
+        import subprocess
+        code = ("import sys; sys.path.insert(0, %r); import platform_macos as m; "
+                "assert m.read_memory()['avail_gb'] > 0; assert m.read_proc(); print('ok')") % str(ROOT / "sluicy")
+        res = subprocess.run([sys.executable, "-c", code], env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+
 class Processes(unittest.TestCase):
     PS = (
         "  101   100  4194304 /opt/homebrew/bin/node /x/next build\n"
@@ -133,7 +144,7 @@ class Timer(unittest.TestCase):
         self.assertEqual(data["StartInterval"], 300)
         self.assertEqual(data["Nice"], 19)
         self.assertTrue(data["StandardOutPath"].startswith(str(d / "logs")))
-        cmds = [" ".join(c) for c in run.calls]
+        cmds = [" ".join([Path(c[0]).name, *c[1:]]) for c in run.calls]
         self.assertIn(f"launchctl bootout gui/501/com.sluicy.conduct", cmds)  # reload when updating
         self.assertIn(f"launchctl bootstrap gui/501 {plist}", cmds)
 

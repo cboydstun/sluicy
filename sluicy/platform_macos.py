@@ -25,12 +25,21 @@ LABEL = "com.sluicy.conduct"
 PRESSURE = {1: (0.0, 0.0), 2: (20.0, 0.0), 4: (60.0, 20.0)}
 
 
+# Absolute paths: sluicy's worker runs with a cleaned env whose PATH need not have /usr/sbin.
+TOOLS = {"sysctl": "/usr/sbin/sysctl", "lsof": "/usr/sbin/lsof", "ps": "/bin/ps", "launchctl": "/bin/launchctl"}
+
+
+def _tool(name):
+    path = TOOLS.get(name, name)
+    return path if os.path.exists(path) else (shutil.which(name) or name)
+
+
 def _run(argv):
     return subprocess.run(argv, capture_output=True, text=True, timeout=30, check=True).stdout
 
 
 def _sysctl(name, run):
-    return int(run(["sysctl", "-n", name]).strip())
+    return int(run([_tool("sysctl"), "-n", name]).strip())
 
 
 def notify(title, message):
@@ -95,7 +104,7 @@ def read_proc(run=_run, ours=()):
     """{pid: (pgrp, rss_bytes, tag, cwd, cmd)}, the shape of the Linux /proc reader. There are no cgroups,
     so `tag` is "sluicy-gate" for a process working under one of `ours` (sluicy's checkouts), else ""."""
     procs = {}
-    for line in run(["ps", "-axo", "pid=,pgid=,rss=,command="]).splitlines():
+    for line in run([_tool("ps"), "-axo", "pid=,pgid=,rss=,command="]).splitlines():
         parts = line.split(None, 3)
         if len(parts) < 3:
             continue
@@ -105,7 +114,7 @@ def read_proc(run=_run, ours=()):
             continue
         procs[pid] = [pgrp, rss, "", "", parts[3].strip() if len(parts) > 3 else ""]
     try:
-        cwds = _lsof_cwds(run(["lsof", "-nP", "-a", "-d", "cwd", "-Fpn"]))
+        cwds = _lsof_cwds(run([_tool("lsof"), "-nP", "-a", "-d", "cwd", "-Fpn"]))
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         cwds = {}
     roots = [str(r).rstrip("/") for r in ours if r]
@@ -147,14 +156,14 @@ def install_timer(argv, agents_dir, logs_dir, run=_run, uid=None):
         "StandardOutPath": str(logs_dir / "conduct.out"),
         "StandardErrorPath": str(logs_dir / "conduct.out"),
     }))
-    _quiet(run, ["launchctl", "bootout", f"gui/{uid}/{LABEL}"])  # not loaded yet is fine
-    run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)])
+    _quiet(run, [_tool("launchctl"), "bootout", f"gui/{uid}/{LABEL}"])  # not loaded yet is fine
+    run([_tool("launchctl"), "bootstrap", f"gui/{uid}", str(plist)])
     return plist
 
 
 def remove_timer(agents_dir, run=_run, uid=None):
     uid = os.getuid() if uid is None else uid
-    _quiet(run, ["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+    _quiet(run, [_tool("launchctl"), "bootout", f"gui/{uid}/{LABEL}"])
     (Path(agents_dir) / f"{LABEL}.plist").unlink(missing_ok=True)
 
 
