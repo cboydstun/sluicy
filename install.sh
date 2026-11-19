@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install sluicy for this user: commands on PATH, the conductor timer, the gate's systemd slice, the
+# Install sluicy for this user: commands on PATH, the conductor timer, the gate's systemd slice (Linux), the
 # Claude Code hooks (user-level, inert in any repository without .sluicy.toml) and the Session Deck.
 #
 #   ./install.sh               install or update (safe to run again)
@@ -22,11 +22,17 @@ done
 say() { printf '%s\n' "$*"; }
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
-[ "$(uname -s)" = Linux ] || die "sluicy runs on Linux and WSL2 for now (it needs systemd and /proc)"
+case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=macos ;;
+    *) die "sluicy runs on Linux, WSL2 and macOS" ;;
+esac
 command -v git > /dev/null || die "git is required"
 command -v python3 > /dev/null || die "python3 (3.11 or newer) is required"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "python3 is $(python3 -V 2>&1 | cut -d' ' -f2); sluicy needs 3.11 or newer"
-if ! systemctl --user show-environment > /dev/null 2>&1; then
+if [ "$os" = macos ]; then
+    say "macOS: workers run as background processes and gates are not memory-capped; the memory governor brakes a gate when the Mac runs low"
+elif ! systemctl --user show-environment > /dev/null 2>&1; then
     if grep -qi microsoft /proc/version 2> /dev/null; then
         say "warning: no systemd user session. On WSL2, put this in /etc/wsl.conf and run 'wsl --shutdown':"
         say "    [boot]"
@@ -45,7 +51,9 @@ ln -sfn "$root/deck/deck.sh" "$bin/deck"
 say "commands: $bin/sluicy, $bin/plan-review, $bin/deck"
 case ":$PATH:" in *":$bin:"*) ;; *) say "warning: $bin is not on your PATH; add it in your shell profile" ;; esac
 
-if command -v systemctl > /dev/null && systemctl --user show-environment > /dev/null 2>&1; then
+if [ "$os" = macos ]; then
+    python3 "$root/sluicy/sluicy.py" timer
+elif command -v systemctl > /dev/null && systemctl --user show-environment > /dev/null 2>&1; then
     units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$units"
     cp "$root/share/sluicy-gate.slice" "$units/sluicy-gate.slice"
@@ -65,6 +73,8 @@ if [ "$deck" = 1 ]; then
         nice -n 10 cargo build --release --quiet --manifest-path "$root/deck/Cargo.toml"
     elif [ ! -x "$target" ] && ! command -v curl > /dev/null; then
         say "warning: neither cargo nor curl found; no deck. Install Rust (https://rustup.rs) and run this again"
+    elif [ ! -x "$target" ] && [ "$os" = macos ]; then
+        say "warning: no prebuilt deck for macOS; install Rust (https://rustup.rs) and run this again"
     elif [ ! -x "$target" ]; then
         url="${SLUICY_RELEASES:-https://github.com/cboydstun/sluicy/releases/latest/download}/deck-$(uname -m)-linux"
         say "deck: downloading $url"

@@ -3,10 +3,14 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+# macOS hands out /var/folders/... temp dirs that resolve to /private/var/...: resolve TMPDIR once, so a
+# path the code resolved and one a test built from tempfile compare equal.
+export TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)/"
 run() { echo "== $*"; "$@"; }
 run python3 tests/test_config.py
 run python3 tests/test_graph.py
 run python3 tests/test_install.py
+run python3 tests/test_platform_macos.py
 run python3 plan-review/test_plan_review.py
 run python3 tests/test_sluicy.py
 run bash deck/test_deck_sh.sh

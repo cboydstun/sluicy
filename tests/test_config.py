@@ -28,6 +28,20 @@ class Validate(unittest.TestCase):
             self.ok(text)
         self.assertIn(needle, str(cm.exception))
 
+    def test_per_os_gate_env_is_merged_over_the_shared_one(self):
+        text = (
+            'project = "p"\n[gate]\nenv = { A = "shared", PATH = "/usr/bin" }\n'
+            '[gate.env_linux]\nPATH = "/linux/bin"\n[gate.env_darwin]\nPATH = "/opt/homebrew/bin"\nB = "mac"\n'
+        )
+        raw = __import__("tomllib").loads(text)
+        mac = config.validate(raw, os_name="darwin")["gate"]["env"]
+        linux = config.validate(__import__("tomllib").loads(text), os_name="linux")["gate"]["env"]
+        self.assertEqual(mac, {"A": "shared", "PATH": "/opt/homebrew/bin", "B": "mac"})
+        self.assertEqual(linux, {"A": "shared", "PATH": "/linux/bin"})
+
+    def test_per_os_env_takes_string_values(self):
+        self.bad('project = "p"\n[gate.env_darwin]\nX = 1\n', "env tables take string values")
+
     def test_minimal_config_gets_defaults(self):
         cfg = self.ok('project = "shop"')
         self.assertEqual(cfg["deploy"]["kind"], "none")

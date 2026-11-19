@@ -27,7 +27,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as sconfig  # noqa: E402
 import graph as sgraph  # noqa: E402
-import platform_linux as plat  # noqa: E402
+# SLUICY_PLATFORM=linux|darwin overrides the OS (the test suite emulates Linux with fake systemd tools).
+MACOS = (os.environ.get("SLUICY_PLATFORM") or sys.platform) == "darwin"
+if MACOS:
+    import platform_macos as plat  # noqa: E402
+else:
+    import platform_linux as plat  # noqa: E402
 
 KEEPALIVE = "ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=60"
 MAX_PUSH_ATTEMPTS = 3
@@ -391,7 +396,10 @@ def _env_float(name, default):
 
 
 def read_memory():
-    """{'avail_gb', 'some', 'full'}: MemAvailable and the avg10 memory pressure percentages."""
+    """{'avail_gb', 'some', 'full'}: MemAvailable and the avg10 memory pressure percentages. On macOS the
+    kernel's own figures, in the same shape (a /proc-shaped SLUICY_MEMINFO, as the tests give, still wins)."""
+    if MACOS and not os.environ.get("SLUICY_MEMINFO"):
+        return plat.read_memory()
     avail_kb = None
     with open(os.environ.get("SLUICY_MEMINFO", "/proc/meminfo")) as f:
         for line in f:
@@ -1700,6 +1708,13 @@ def read_proc(root):
     return procs
 
 
+def current_procs():
+    """Every process now, from /proc (or a /proc-shaped SLUICY_PROC); on macOS from ps and lsof."""
+    if MACOS and not os.environ.get("SLUICY_PROC"):
+        return plat.read_proc(ours=[str(checkouts_root())])
+    return read_proc(os.environ.get("SLUICY_PROC", "/proc"))
+
+
 def hogs(procs, sessions):
     """Process groups using ≥ 3 GB outside sluicy's own gate and preflight, with the session that owns them."""
     groups = {}
@@ -1724,7 +1739,7 @@ def conduct_hogs(conn, state, sessions):
         return []
     done = set(state["done"])
     acted = []
-    for h in hogs(read_proc(os.environ.get("SLUICY_PROC", "/proc")), sessions):
+    for h in hogs(current_procs(), sessions):
         key = f"hog:{h['pgrp']}"
         if key in done:
             continue
@@ -1866,7 +1881,7 @@ def leftovers(path, main):
 
 
 def process_inside(path):
-    procs = read_proc(os.environ.get("SLUICY_PROC", "/proc"))
+    procs = current_procs()
     path = str(path).rstrip("/")
     return next((pid for pid, p in procs.items() if p[3] == path or p[3].startswith(path + "/")), None)
 
@@ -2042,9 +2057,19 @@ def cmd_init(args):
 
 
 def install_conduct_timer():
-    """`sluicy conduct` every 5 minutes as a systemd user timer. Not under tests (SLUICY_HOME) or without a
-    systemd user session."""
-    if os.environ.get("SLUICY_HOME") or not shutil.which("systemctl"):
+    """`sluicy conduct` every 5 minutes: a systemd user timer, or a launchd agent on macOS. Not under tests
+    (SLUICY_HOME) or without a systemd user session."""
+    if os.environ.get("SLUICY_HOME"):
+        return
+    if MACOS:
+        try:
+            plist = plat.install_timer([sys.executable, str(worker_script()), "conduct"],
+                                       Path.home() / "Library" / "LaunchAgents", home())
+            print(f"conduct timer: on, every 5 min ({plist})")
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"conduct timer: not enabled ({str(e)[:120]})")
+        return
+    if not shutil.which("systemctl"):
         return
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
@@ -2786,8 +2811,10 @@ def main():
     s = sub.add_parser("paths", help="where sluicy keeps things")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_paths)
-    s = sub.add_parser("timer", help="install the conductor's systemd user timer (install.sh runs it)")
+    s = sub.add_parser("timer", help="install the conductor's timer: systemd user timer, or launchd on macOS")
     s.set_defaults(fn=lambda _a: install_conduct_timer() or 0)
+    s = sub.add_parser("untimer", help="remove the conductor's launchd agent (macOS; uninstall.sh runs it)")
+    s.set_defaults(fn=lambda _a: (plat.remove_timer(Path.home() / "Library" / "LaunchAgents") if MACOS else None) or 0)
     s = sub.add_parser("stamps", help="what production runs, per component (for the Deck)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_stamps)

@@ -221,6 +221,7 @@ class Base(unittest.TestCase):
             "SY_CTL": str(self.ctl),
             "SLUICY_HOME": str(self.root / "state"),
             "SLUICY_CHECKOUTS": str(self.root / "checkouts"),
+            "SLUICY_PLATFORM": "linux",  # the fakes below are Linux tools (systemctl, journalctl)
             "SLUICY_NO_SCOPE": "1",
             "SLUICY_NO_NOTIFY": "1",
             "SLUICY_NO_SPAWN": "1",

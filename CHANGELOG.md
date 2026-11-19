@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- macOS support (`platform_macos`). Gates run uncapped, and the memory governor brakes them from the
+  kernel's memorystatus figures. Workers run as detached processes, the conductor timer is a launchd
+  agent, and `ps`/`lsof` stand in for `/proc`. `install.sh` and `uninstall.sh` accept Darwin.
+- `[gate.env_linux]` and `[gate.env_darwin]`: merged over `[gate] env` on that OS. Older sluicy rejects
+  these keys, so update every machine before a project adds them.
+- `SLUICY_PLATFORM` overrides the detected OS.
+- Tests pass on macOS: `run.sh` resolves TMPDIR (`/var` vs `/private/var`), and the install test uses
+  the running python.
+
 ## 0.2.1 - 2026-11-13
 
 - Code map: a ticket that landed before the map reached it (the usual case on a busy queue, since the map

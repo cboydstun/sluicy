@@ -10,6 +10,9 @@ for name in sluicy plan-review deck; do
         echo "removed $bin/$name"
     fi
 done
+if [ "$(uname -s)" = Darwin ]; then
+    python3 "$root/sluicy/sluicy.py" untimer || true
+fi
 units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 if command -v systemctl > /dev/null; then
     systemctl --user disable --now sluicy-conduct.timer 2> /dev/null || true
