@@ -859,6 +859,24 @@ class MemoryBrakes(Base):
         self.assertEqual(self.ticket(a)["detail"], "")
         self.assertEqual(self.count("gates.log"), 1)
 
+    def test_unreadable_memory_waits_alerts_and_logs_when_it_reads_again(self):
+        # macOS turns a failing sysctl into an OSError; a missing meminfo is the same OSError here.
+        (self.ctl / "meminfo").unlink()
+        a = self.submit("fix/a", "--ride")
+        worker = subprocess.Popen(["python3", str(TOOL), "run"], cwd=self.dev, env=self.env)
+        self.addCleanup(worker.kill)
+        for _ in range(100):
+            if "waiting for memory" in self.ticket(a)["detail"]:
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.ticket(a)["state"], "queued")
+        self.assertIn("waiting for memory", self.ticket(a)["detail"])
+        self.set_memory(64)
+        self.assertEqual(worker.wait(timeout=30), 0)
+        self.assertEqual(self.state(a), "merged")
+        self.assertIn(f"ticket {a} (fix/a): waiting for memory", self.alerts())  # said once, like a short read
+        self.assertIn("memory ok:", Path(self.ticket(a)["log_path"]).read_text())
+
     def test_pressure_mid_gate_stops_the_scope_and_requeues(self):
         (self.ctl / "gate-spike-once").touch()
         a = self.submit("fix/a", "--ride")

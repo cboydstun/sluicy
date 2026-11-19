@@ -164,7 +164,7 @@ def install_timer(argv, agents_dir, logs_dir, run=_run, uid=None):
     _quiet(run, [_tool("launchctl"), "bootout", f"gui/{uid}/{LABEL}"])  # not loaded yet is fine
     try:
         run([_tool("launchctl"), "bootstrap", f"gui/{uid}", str(plist)])
-    except subprocess.CalledProcessError:
+    except subprocess.SubprocessError:
         # launchd can refuse (5: Input/output error) while the job it just booted out is still unloading.
         time.sleep(2)
         run([_tool("launchctl"), "bootstrap", f"gui/{uid}", str(plist)])
@@ -185,19 +185,37 @@ def stable_python(executable, candidates=("/opt/homebrew/bin/python3", "/usr/loc
     return executable
 
 
-def kill_in(root, log, exclude=(), run=_run, wait=3.0):
-    """Stop every process still working under `root` (the ticket's checkout). There is no scope to
-    stop on macOS, and a gate's dev servers, test databases or emulators can leave its process group.
-    Returns the pids it signalled."""
+def _ttys(run):
+    """{pid: tty} from ps; "??" is no controlling terminal."""
+    out = {}
+    for line in run([_tool("ps"), "-axo", "pid=,tty="]).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit():
+            out[int(parts[0])] = parts[1]
+    return out
+
+
+def kill_in(root, log, exclude=(), run=_run, wait=10.0):
+    """Stop what a gate left running under `root` (the ticket's checkout): there is no scope to stop on
+    macOS, and a gate's dev servers, test databases or emulators can leave its process group. Run it
+    after the gate's own group is gone. Only processes without a terminal: the gate's all start with
+    no tty, while a person's shell, editor or Claude session `cd`'d into the checkout has one, and
+    is left alone (and logged). Returns the pids it signalled."""
     root = str(root).rstrip("/")
     try:
         procs = read_proc(run=run, ours=[root])
+        ttys = _ttys(run)
     except (OSError, subprocess.SubprocessError):
         return []
-    left = [pid for pid, p in procs.items() if p[2] == "sluicy-gate" and pid not in exclude and pid > 1]
+    inside = [pid for pid, p in procs.items() if p[2] == "sluicy-gate" and pid not in exclude and pid > 1]
+    kept = sorted(pid for pid in inside if ttys.get(pid, "??") not in ("??", "?", "-"))
+    left = sorted(pid for pid in inside if pid not in kept)
+    if kept:
+        log.write(f"sluicy: leaving {len(kept)} process(es) with a terminal in {root}: {' '.join(map(str, kept))}\n")
     if not left:
+        log.flush()
         return []
-    log.write(f"sluicy: stopping {len(left)} process(es) left in {root}: {' '.join(map(str, sorted(left)))}\n")
+    log.write(f"sluicy: stopping {len(left)} process(es) left in {root}: {' '.join(map(str, left))}\n")
     log.flush()
     for sig in (signal.SIGTERM, signal.SIGKILL):
         alive = []

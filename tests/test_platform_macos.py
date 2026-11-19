@@ -212,20 +212,24 @@ class Sweep(unittest.TestCase):
         child = subprocess.Popen(["sleep", "60"], cwd=root, start_new_session=True)
         try:
             run = runner({
-                "ps -axo": f"{child.pid} {child.pid} 100 sleep 60\n{os.getpid()} 1 100 python3\n",
-                "lsof": f"p{child.pid}\nn{root}\np{os.getpid()}\nn{root}\n",
+                # 999999: a person's shell `cd`'d into the checkout, on a terminal; never killed.
+                "ps -axo pid=,tty=": f"{child.pid} ??\n{os.getpid()} ??\n999999 ttys001\n",
+                "ps -axo": f"{child.pid} {child.pid} 100 sleep 60\n{os.getpid()} 1 100 python3\n999999 999999 100 -zsh\n",
+                "lsof": f"p{child.pid}\nn{root}\np{os.getpid()}\nn{root}\np999999\nn{root}/apps\n",
             })
             log = io.StringIO()
             hit = mac.kill_in(root, log, exclude={os.getpid()}, run=run, wait=5)
             self.assertEqual(hit, [child.pid])
             self.assertIsNotNone(child.wait(timeout=5))
             self.assertIn("stopping 1 process(es)", log.getvalue())
+            self.assertIn("leaving 1 process(es) with a terminal", log.getvalue())
         finally:
             if child.poll() is None:
                 child.kill()
 
     def test_kill_in_leaves_other_directories_alone(self):
-        run = runner({"ps -axo": "4242 4242 100 vim\n", "lsof": "p4242\nn/Users/me/notes\n"})
+        run = runner({"ps -axo pid=,tty=": "4242 ??\n", "ps -axo": "4242 4242 100 vim\n",
+                      "lsof": "p4242\nn/Users/me/notes\n"})
         self.assertEqual(mac.kill_in("/tmp/checkout", io.StringIO(), run=run), [])
 
 

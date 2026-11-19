@@ -454,7 +454,13 @@ def wait_for_memory(conn, t, log):
             m = read_memory()
         except OSError as e:
             good_since = None
-            set_ticket(conn, t["id"], detail=f"waiting for memory: {e}"[:200])
+            detail = f"waiting for memory: {e}"[:200]
+            if not waited:
+                log.write(detail + "\n")
+                log.flush()
+                alert(f"ticket {t['id']} ({t['branch']}): {detail}")
+            waited = True
+            set_ticket(conn, t["id"], detail=detail)
             time.sleep(poll)
             continue
         if room_to_start(m):
@@ -485,13 +491,18 @@ def gate_unit_prefix(tid, project=None):
 def stop_gate(tid, log, project=None):
     """Stop the gate's scope: systemd kills the whole tree (test runners, dev servers, browsers)."""
     pattern = gate_unit_prefix(tid, project) + "*"
-    if MACOS and P is not None and (project is None or project == P.name):
-        plat.kill_in(checkout(), log, exclude={os.getpid()})
     rc, err = plat.stop_units(pattern)
     if rc is None:
         return
     log.write(f"$ systemctl --user stop {pattern}  rc={rc} {err}\n")
     log.flush()
+
+
+def sweep_gate(log):
+    """macOS, once the gate's process group is gone: no scope held its tree, so stop what it left
+    running in the checkout (see platform_macos.kill_in). Nothing to do on Linux."""
+    if MACOS and P is not None:
+        plat.kill_in(checkout(), log, exclude={os.getpid()})
 
 
 def oomd_killed_gate(tid, since):
@@ -524,11 +535,19 @@ def run_gated_push(conn, tid, env, log):
     # Its own session, so a dead worker leaves it running: reconcile waits for this group.
     set_ticket(conn, tid, push_pgid=proc.pid)
     bad = 0
+    unread, warned = 0, False
     while proc.poll() is None:
         try:
             m = read_memory()
-        except OSError:
+            unread = 0
+        except OSError as e:
             m = None
+            unread += 1
+            if unread >= need and not warned:
+                warned = True
+                log.write(f"\nsluicy: memory unreadable ({e}); the brake is off until it reads again\n")
+                log.flush()
+                alert(f"ticket {tid}: memory unreadable during the gate ({e}); the brake is off")
         bad = bad + 1 if m and stalling(m) else 0
         if bad >= need:
             reason = f"memory pressure: {describe(m)}"
@@ -544,6 +563,7 @@ def run_gated_push(conn, tid, env, log):
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, 9)
                 proc.wait()
+            sweep_gate(log)
             return reason
         time.sleep(poll)
     if proc.returncode != 0 and oomd_killed_gate(tid, started):
@@ -823,6 +843,7 @@ def settle_orphan_push(t):
                     pass
         # A gate scope can outlive its push: systemd keeps the scope when the push itself is killed.
         stop_gate(t["id"], log)
+        sweep_gate(log)
 
 
 def mark_live(conn, t, old_stamps=None):
@@ -2083,7 +2104,7 @@ def install_conduct_timer():
             plist = plat.install_timer([plat.stable_python(sys.executable), str(worker_script()), "conduct"],
                                        Path.home() / "Library" / "LaunchAgents", home())
             print(f"conduct timer: on, every 5 min ({plist})")
-        except (OSError, subprocess.CalledProcessError) as e:
+        except (OSError, subprocess.SubprocessError) as e:
             print(f"conduct timer: not enabled ({str(e)[:120]})")
         return
     if not shutil.which("systemctl"):
@@ -2689,7 +2710,7 @@ def cmd_scope(args):
             reserve = float(sconfig.load(f)["gate"]["mem_reserve_gb"])
     mem = plat.gate_mem_max_gb(reserve)
     argv = plat.scoped(cmd, f"sluicy-gate-manual-{os.getpid()}", mem)
-    if argv is cmd:
+    if argv is cmd or MACOS:  # macOS wraps it in `nice`, which caps nothing
         print("sluicy: no systemd user scope available; running uncapped", file=sys.stderr)
     env = {**os.environ, "SLUICY_GATE_SCOPED": "1"}
     os.execvpe(argv[0], argv, env)
