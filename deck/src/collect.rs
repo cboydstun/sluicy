@@ -654,7 +654,7 @@ pub fn registry_fingerprint(c: &Cfg) -> u64 {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .and_then(|s| s.parse::<i32>().ok())
-                .map(|pid| Path::new(&format!("/proc/{pid}")).exists())
+                .map(pid_alive)
                 .unwrap_or(false);
             add(&p, alive);
         }
@@ -1068,6 +1068,20 @@ fn latest_gate_log(dir: &Path) -> Option<PathBuf> {
     best.map(|b| b.1)
 }
 
+/// A process exists (EPERM: it does, under another user). Portable, unlike /proc/<pid>.
+fn pid_alive(pid: i32) -> bool {
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// The 1, 5 and 15 minute load averages, formatted as /proc/loadavg prints them.
+fn load_avg() -> Vec<String> {
+    let mut l = [0f64; 3];
+    let n = unsafe { libc::getloadavg(l.as_mut_ptr(), 3) };
+    l.iter().take(n.max(0) as usize).map(|x| format!("{x:.2}")).collect()
+}
+
 pub fn collect_system(c: &Cfg, procs: &Procs) -> Value {
     let m = procs::meminfo();
     let g = |k: &str| *m.get(k).unwrap_or(&0);
@@ -1122,11 +1136,13 @@ pub fn collect_system(c: &Cfg, procs: &Procs) -> Value {
         None => (String::new(), vec![]),
     };
     let mut warnings = vec![];
-    if avail_pct < c.mem_warn_pct {
+    // No MemTotal means the figures could not be read, not that nothing is free.
+    let mem_known = g("MemTotal") > 0 && m.contains_key("MemAvailable");
+    if mem_known && avail_pct < c.mem_warn_pct {
         warnings.push(format!("Only {avail_pct:.0}% memory available"));
     }
     // Swap fills slowly and stays full on a healthy box; it matters only once memory is short too.
-    let swap_hot = swap_used_pct > c.swap_warn_pct && avail_pct < 2.0 * c.mem_warn_pct;
+    let swap_hot = mem_known && swap_used_pct > c.swap_warn_pct && avail_pct < 2.0 * c.mem_warn_pct;
     if swap_hot {
         warnings.push(format!("Swap {swap_used_pct:.0}% used"));
     }
@@ -1138,12 +1154,7 @@ pub fn collect_system(c: &Cfg, procs: &Procs) -> Value {
     } else {
         vec![]
     };
-    let load: Vec<String> = fs::read_to_string("/proc/loadavg")
-        .unwrap_or_default()
-        .split_whitespace()
-        .take(3)
-        .map(String::from)
-        .collect();
+    let load = load_avg();
     let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
     let locks: Map<String, Value> = c
         .locks
