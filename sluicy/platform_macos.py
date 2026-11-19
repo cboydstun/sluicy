@@ -15,7 +15,9 @@ Every reader takes `run` (argv -> stdout) so the tests can feed it canned output
 import os
 import plistlib
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 GB = 1024 ** 3
@@ -26,7 +28,8 @@ PRESSURE = {1: (0.0, 0.0), 2: (20.0, 0.0), 4: (60.0, 20.0)}
 
 
 # Absolute paths: sluicy's worker runs with a cleaned env whose PATH need not have /usr/sbin.
-TOOLS = {"sysctl": "/usr/sbin/sysctl", "lsof": "/usr/sbin/lsof", "ps": "/bin/ps", "launchctl": "/bin/launchctl"}
+TOOLS = {"sysctl": "/usr/sbin/sysctl", "lsof": "/usr/sbin/lsof", "ps": "/bin/ps", "launchctl": "/bin/launchctl",
+         "nice": "/usr/bin/nice"}
 
 
 def _tool(name):
@@ -76,7 +79,8 @@ def scope_available():
 
 
 def scoped(argv, unit, mem_max_gb):
-    return argv
+    """No scope to cap it: the gate runs niced, as the Linux scope runs it (--nice=10)."""
+    return [_tool("nice"), "-n", "10", *argv]
 
 
 def stop_units(pattern):
@@ -150,15 +154,79 @@ def install_timer(argv, agents_dir, logs_dir, run=_run, uid=None):
         "ProgramArguments": [str(a) for a in argv],
         "StartInterval": 300,
         "RunAtLoad": False,
-        "Nice": 19,
-        "LowPriorityIO": True,
-        "ProcessType": "Background",
+        # No Nice, LowPriorityIO or Background ProcessType: a worker the conductor starts is a plain
+        # child (no transient unit, as on Linux), inherits them and cannot drop them, so the whole gate
+        # would run at nice 19 on throttled IO. The conduct pass itself is a few cheap reads.
+        "ProcessType": "Standard",
         "StandardOutPath": str(logs_dir / "conduct.out"),
         "StandardErrorPath": str(logs_dir / "conduct.out"),
     }))
     _quiet(run, [_tool("launchctl"), "bootout", f"gui/{uid}/{LABEL}"])  # not loaded yet is fine
-    run([_tool("launchctl"), "bootstrap", f"gui/{uid}", str(plist)])
+    try:
+        run([_tool("launchctl"), "bootstrap", f"gui/{uid}", str(plist)])
+    except subprocess.CalledProcessError:
+        # launchd can refuse (5: Input/output error) while the job it just booted out is still unloading.
+        time.sleep(2)
+        run([_tool("launchctl"), "bootstrap", f"gui/{uid}", str(plist)])
     return plist
+
+
+def stable_python(executable, candidates=("/opt/homebrew/bin/python3", "/usr/local/bin/python3")):
+    """The interpreter for the launch agent: Homebrew's unversioned `python3` link when it is the same
+    interpreter as `executable`, so a Homebrew Python upgrade (which removes python@3.N) does not
+    leave the agent pointing at a deleted binary. Otherwise `executable` itself."""
+    try:
+        real = os.path.realpath(executable)
+        for cand in candidates:
+            if os.path.exists(cand) and os.path.realpath(cand) == real:
+                return cand
+    except OSError:
+        pass
+    return executable
+
+
+def kill_in(root, log, exclude=(), run=_run, wait=3.0):
+    """Stop every process still working under `root` (the ticket's checkout). There is no scope to
+    stop on macOS, and a gate's dev servers, test databases or emulators can leave its process group.
+    Returns the pids it signalled."""
+    root = str(root).rstrip("/")
+    try:
+        procs = read_proc(run=run, ours=[root])
+    except (OSError, subprocess.SubprocessError):
+        return []
+    left = [pid for pid, p in procs.items() if p[2] == "sluicy-gate" and pid not in exclude and pid > 1]
+    if not left:
+        return []
+    log.write(f"sluicy: stopping {len(left)} process(es) left in {root}: {' '.join(map(str, sorted(left)))}\n")
+    log.flush()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        alive = []
+        for pid in left:
+            try:
+                os.kill(pid, sig)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+        if sig == signal.SIGTERM and alive:
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline and any(_alive(p) for p in alive):
+                time.sleep(0.2)
+            left = [p for p in alive if _alive(p)]
+            if not left:
+                break
+    return sorted(set(alive) | set(left))
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def remove_timer(agents_dir, run=_run, uid=None):

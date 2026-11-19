@@ -399,7 +399,11 @@ def read_memory():
     """{'avail_gb', 'some', 'full'}: MemAvailable and the avg10 memory pressure percentages. On macOS the
     kernel's own figures, in the same shape (a /proc-shaped SLUICY_MEMINFO, as the tests give, still wins)."""
     if MACOS and not os.environ.get("SLUICY_MEMINFO"):
-        return plat.read_memory()
+        try:
+            return plat.read_memory()
+        except (subprocess.SubprocessError, ValueError) as e:
+            # sysctl failing or timing out: an OSError, which every caller already treats as "unknown".
+            raise OSError(f"cannot read memory: {e}") from e
     avail_kb = None
     with open(os.environ.get("SLUICY_MEMINFO", "/proc/meminfo")) as f:
         for line in f:
@@ -446,7 +450,13 @@ def wait_for_memory(conn, t, log):
     good_since = None
     waited = False
     while True:
-        m = read_memory()
+        try:
+            m = read_memory()
+        except OSError as e:
+            good_since = None
+            set_ticket(conn, t["id"], detail=f"waiting for memory: {e}"[:200])
+            time.sleep(poll)
+            continue
         if room_to_start(m):
             good_since = good_since or time.monotonic()
             if time.monotonic() - good_since >= settle:
@@ -475,6 +485,8 @@ def gate_unit_prefix(tid, project=None):
 def stop_gate(tid, log, project=None):
     """Stop the gate's scope: systemd kills the whole tree (test runners, dev servers, browsers)."""
     pattern = gate_unit_prefix(tid, project) + "*"
+    if MACOS and P is not None and (project is None or project == P.name):
+        plat.kill_in(checkout(), log, exclude={os.getpid()})
     rc, err = plat.stop_units(pattern)
     if rc is None:
         return
@@ -1200,7 +1212,10 @@ def map_room(conn):
     """(ok, why): the map runs only on a quiet machine, so it can never compete with a gate."""
     if gate_busy(conn):
         return False, "a gate is running"
-    m = read_memory()
+    try:
+        m = read_memory()
+    except OSError as e:
+        return False, str(e)
     if m["avail_gb"] < float(P.cfg["graph"]["min_avail_gb"]) or stalling(m):
         return False, f"not enough memory ({describe(m)})"
     return True, ""
@@ -2065,7 +2080,7 @@ def install_conduct_timer():
         return
     if MACOS:
         try:
-            plist = plat.install_timer([sys.executable, str(worker_script()), "conduct"],
+            plist = plat.install_timer([plat.stable_python(sys.executable), str(worker_script()), "conduct"],
                                        Path.home() / "Library" / "LaunchAgents", home())
             print(f"conduct timer: on, every 5 min ({plist})")
         except (OSError, subprocess.CalledProcessError) as e:

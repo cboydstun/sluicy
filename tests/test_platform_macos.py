@@ -2,7 +2,10 @@
 
     python3 tests/test_platform_macos.py
 """
+import io
+import os
 import plistlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -141,7 +144,7 @@ class Units(unittest.TestCase):
     def test_no_scope_and_no_units(self):
         # No cgroups on macOS: gates run uncapped and the memory governor is the brake.
         self.assertFalse(mac.scope_available())
-        self.assertEqual(mac.scoped(["git", "push"], "u", 8.0), ["git", "push"])
+        self.assertEqual(mac.scoped(["git", "push"], "u", 8.0)[1:], ["-n", "10", "git", "push"])  # niced, as Linux's scope
         self.assertEqual(mac.stop_units("sluicy-gate-*"), (None, ""))
         self.assertFalse(mac.oomd_killed("sluicy-gate-", 0))
         self.assertFalse(mac.start_unit("u", ["true"], {}, "/", "/dev/null"))
@@ -156,11 +159,43 @@ class Timer(unittest.TestCase):
         self.assertEqual(data["Label"], "com.sluicy.conduct")
         self.assertEqual(data["ProgramArguments"], ["/usr/bin/python3", "/x/sluicy.py", "conduct"])
         self.assertEqual(data["StartInterval"], 300)
-        self.assertEqual(data["Nice"], 19)
+        # A worker the conductor starts inherits the agent's priority and cannot raise it back.
+        self.assertNotIn("Nice", data)
+        self.assertNotIn("LowPriorityIO", data)
+        self.assertEqual(data["ProcessType"], "Standard")
         self.assertTrue(data["StandardOutPath"].startswith(str(d / "logs")))
         cmds = [" ".join([Path(c[0]).name, *c[1:]]) for c in run.calls]
         self.assertIn(f"launchctl bootout gui/501/com.sluicy.conduct", cmds)  # reload when updating
         self.assertIn(f"launchctl bootstrap gui/501 {plist}", cmds)
+
+    def test_bootstrap_retries_once_while_the_old_job_unloads(self):
+        d = Path(tempfile.mkdtemp())
+        tries = []
+
+        def run(argv):
+            if argv[1] == "bootstrap":
+                tries.append(argv)
+                if len(tries) == 1:
+                    raise subprocess.CalledProcessError(5, argv, "", "Bootstrap failed: 5: Input/output error")
+            return ""
+
+        mac.time.sleep, sleep = (lambda _s: None), mac.time.sleep
+        try:
+            mac.install_timer(["x"], d, d, run=run, uid=501)
+        finally:
+            mac.time.sleep = sleep
+        self.assertEqual(len(tries), 2)
+
+    def test_stable_python_follows_the_unversioned_homebrew_link(self):
+        d = Path(tempfile.mkdtemp())
+        real = d / "python3.14"
+        real.write_text("")
+        link = d / "python3"
+        link.symlink_to(real)
+        self.assertEqual(mac.stable_python(str(real), candidates=(str(d / "missing"), str(link))), str(link))
+        other = d / "python3.13"
+        other.write_text("")
+        self.assertEqual(mac.stable_python(str(other), candidates=(str(link),)), str(other))
 
     def test_remove_timer_unloads_and_deletes(self):
         d = Path(tempfile.mkdtemp())
@@ -168,6 +203,45 @@ class Timer(unittest.TestCase):
         plist = mac.install_timer(["x"], d, d, run=run, uid=501)
         mac.remove_timer(d, run=run, uid=501)
         self.assertFalse(plist.exists())
+
+
+class Sweep(unittest.TestCase):
+    def test_kill_in_stops_what_left_the_gate_group_in_the_checkout(self):
+        root = Path(tempfile.mkdtemp())
+        # A detached child, as a dev server or test database started with setsid would be.
+        child = subprocess.Popen(["sleep", "60"], cwd=root, start_new_session=True)
+        try:
+            run = runner({
+                "ps -axo": f"{child.pid} {child.pid} 100 sleep 60\n{os.getpid()} 1 100 python3\n",
+                "lsof": f"p{child.pid}\nn{root}\np{os.getpid()}\nn{root}\n",
+            })
+            log = io.StringIO()
+            hit = mac.kill_in(root, log, exclude={os.getpid()}, run=run, wait=5)
+            self.assertEqual(hit, [child.pid])
+            self.assertIsNotNone(child.wait(timeout=5))
+            self.assertIn("stopping 1 process(es)", log.getvalue())
+        finally:
+            if child.poll() is None:
+                child.kill()
+
+    def test_kill_in_leaves_other_directories_alone(self):
+        run = runner({"ps -axo": "4242 4242 100 vim\n", "lsof": "p4242\nn/Users/me/notes\n"})
+        self.assertEqual(mac.kill_in("/tmp/checkout", io.StringIO(), run=run), [])
+
+
+class MemoryReadFailure(unittest.TestCase):
+    def test_a_failing_sysctl_is_an_oserror_for_the_governor(self):
+        # The worker's callers treat OSError as "memory unknown"; a raw CalledProcessError killed it.
+        code = (
+            "import subprocess, sluicy\n"
+            "def boom(): raise subprocess.CalledProcessError(1, ['sysctl'])\n"
+            "sluicy.plat.read_memory = boom\n"
+            "try:\n    sluicy.read_memory()\nexcept OSError as e:\n    print('oserror', e)\n"
+        )
+        env = {**os.environ, "SLUICY_PLATFORM": "darwin", "PYTHONPATH": str(ROOT / "sluicy")}
+        env.pop("SLUICY_MEMINFO", None)
+        res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("oserror cannot read memory", res.stdout, res.stderr)
 
 
 if __name__ == "__main__":

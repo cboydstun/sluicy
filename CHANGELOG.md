@@ -10,6 +10,17 @@
 - `SLUICY_PLATFORM` overrides the detected OS.
 - Tests pass on macOS: `run.sh` resolves TMPDIR (`/var` vs `/private/var`), and the install test uses
   the running python.
+- macOS fixes from review:
+  - A failing or slow `sysctl` no longer kills the worker in the middle of a gate. It reads as "memory
+    unknown", as on Linux.
+  - A worker started by the conductor no longer inherits the launch agent's nice 19 and Background
+    policy. The agent runs at standard priority, and the gate itself runs at nice 10, as Linux's scope does.
+  - A brake or an orphaned push also stops processes that left the gate's process group but still work
+    in the ticket's checkout (dev servers, test databases).
+  - The launch agent uses Homebrew's unversioned `python3` link when it is the same interpreter, so a
+    Python upgrade doesn't strand it. `bootstrap` retries once while the old job unloads.
+  - Deck: processes, memory, CPU, load and session liveness come from libproc, sysctl and Mach on
+    macOS. Before this the header read "0% memory available" and every session looked dead.
 
 ## 0.2.1 - 2026-11-13
 
