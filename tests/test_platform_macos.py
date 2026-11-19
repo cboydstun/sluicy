@@ -123,6 +123,20 @@ class Processes(unittest.TestCase):
         self.assertTrue(all(p[3] == "" for p in procs.values()))
 
 
+class Hogs(unittest.TestCase):
+    def test_mac_desktop_apps_are_not_hogs(self):
+        import os
+        os.environ.setdefault("SLUICY_HOME", tempfile.mkdtemp())
+        import sluicy
+        big = 10 * GB
+        procs = {
+            1291: (1291, big, "", "/", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=x"),
+            1500: (1500, big, "", "/", "/Applications/Cursor.app/Contents/MacOS/Cursor"),
+            2000: (2000, big, "", "/Users/me/proj", "/opt/homebrew/bin/node next build"),
+        }
+        self.assertEqual([h["pid"] for h in sluicy.hogs(procs, [])], [2000])
+
+
 class Units(unittest.TestCase):
     def test_no_scope_and_no_units(self):
         # No cgroups on macOS: gates run uncapped and the memory governor is the brake.

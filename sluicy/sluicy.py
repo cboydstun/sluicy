@@ -1520,6 +1520,8 @@ HOG_BYTES = 3 * 1024 ** 3
 OURS_CGROUP = ("sluicy-gate", "sluicy-preflight", "sluicy-worker", "sluicy-conduct")
 # A person's own apps are not workloads a session can cap (the first live run flagged Chrome showing the Deck).
 DESKTOP_APP = re.compile(r"(^|/)(chrome|chromium|firefox|code|gnome-shell|Xwayland|slack|spotify)( |$)")
+# A macOS app bundle (Chrome, an editor, Slack...): its path has spaces, so match the whole command line.
+MAC_APP = re.compile(r"^/(System/)?Applications/[^\n]*?\.app/Contents/")
 
 
 def conduct_state():
@@ -1726,7 +1728,7 @@ def hogs(procs, sessions):
             g.update(pid=pid, cwd=cwd, cmd=cmd)
     out = []
     for pgrp, g in groups.items():
-        if g["ours"] or g["rss"] < HOG_BYTES or DESKTOP_APP.search(g["cmd"].split(" ")[0]):
+        if g["ours"] or g["rss"] < HOG_BYTES or DESKTOP_APP.search(g["cmd"].split(" ")[0]) or MAC_APP.match(g["cmd"]):
             continue
         who = next((a.get("name") for a in sessions if a.get("cwd") and g["cwd"].startswith(str(a["cwd"]).rstrip("/"))), None)
         out.append({"pgrp": pgrp, "pid": g["pid"], "gb": round(g["rss"] / 1024 ** 3, 1), "cwd": g["cwd"],
