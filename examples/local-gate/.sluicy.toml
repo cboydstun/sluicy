@@ -9,14 +9,14 @@ kind = "none"
 
 [gate]
 waivers = ["SKIP_BUILD"]
-# Machine paths differ: give each OS its own table (merged over `env` on that OS only).
+# Settings the gate needs on every machine. Tool paths live in scripts/toolchain.sh, which [deps] and
+# [init] use too. Per-OS values can go in env_linux / env_darwin (merged over `env` on that OS only).
 env = { TZ = "America/Chicago" }
-env_linux = { PATH = "/usr/local/bin:/usr/bin:/bin" }
-env_darwin = { PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" }
 mem_reserve_gb = 4
 
 [deps]
-"package-lock.json" = ["npm", "ci", "--no-audit", "--no-fund"]
+"package-lock.json" = ["bash", "scripts/install.sh"]
 
 [init]
 copy_files = [".env.local"]
+install = [{ dir = ".", command = ["bash", "scripts/install.sh"] }]

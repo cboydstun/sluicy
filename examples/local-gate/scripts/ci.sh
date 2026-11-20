@@ -5,6 +5,7 @@
 #   SKIP_BUILD=1   skip the build stage (a sluicy waiver: `--waive SKIP_BUILD="reason"`)
 set -uo pipefail
 cd "$(dirname "$0")/.."
+. scripts/toolchain.sh
 ERRORS=0
 base="${CI_BASE:-origin/main}"
 changed="$(git diff --name-only "$base" 2> /dev/null; git ls-files --others --exclude-standard)"
@@ -27,7 +28,7 @@ step() {
 
 # ---- edit below: one block per stage ----
 if touched '^(src|app|lib|test|package\.json|package-lock\.json|tsconfig)'; then
-  step "install" npm ci --no-audit --no-fund
+  step "install" bash scripts/install.sh
   step "lint" npm run -s lint
   step "typecheck" npm run -s type-check
   step "test" npm test --silent

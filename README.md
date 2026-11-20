@@ -82,10 +82,13 @@ sluicy is built for gating on your own machine, so a repository needs no hosted 
    - `.githooks/pre-push` gates only pushes to main and runs one gate per machine (`flock` on Linux, a
      `mkdir` lock on macOS);
    - `scripts/ci.sh` runs each stage when its files changed;
+   - `scripts/install.sh` installs dependencies for `[deps]` and `sluicy init`;
    - `.sluicy.toml` is a starting config.
 2. Put each workflow's steps into `scripts/ci.sh`, together with the env they set (`TZ`, `NODE_OPTIONS`,
    placeholder secrets).
-   - Machine paths go in `[gate] env_linux` / `env_darwin`, never in the script.
+   - The worker, `[deps]`, `init` and the gate all start with a bare PATH, and `[gate] env` reaches only
+     the gate. Tool lookup (Homebrew, fnm, nvm) therefore lives in `scripts/toolchain.sh`, which the
+     other scripts source.
    - A service container (Postgres, MongoDB) becomes a local server or an in-memory test server.
 3. If a workflow deployed (`vercel deploy --prod`), either turn on the host's Git integration
    (`kind = "none"`) or move that command to `[deploy] command`.
