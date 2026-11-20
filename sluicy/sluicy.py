@@ -192,7 +192,9 @@ def git(*args, cwd=None, check=True, log=None, timeout=None, extra_env=None):
 
 
 def alert(message):
+    """One line per alert (a multi-line error is joined with " | "), so a reader can tell where one ends."""
     home().mkdir(parents=True, exist_ok=True)
+    message = " | ".join(line.strip() for line in str(message).splitlines() if line.strip())
     with (home() / "alerts.log").open("a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     plat.notify("sluicy", message)
@@ -1552,6 +1554,12 @@ def cmd_debts(args):
 # ---- conduct: what a person would do by hand, done by code every few minutes
 
 INFRA_SIGNS = ("worker error:", "memory brakes x", "deps step failed")
+# A network blip (GitHub unreachable, DNS, a dropped ssh): wait and retry, longer each time, instead of
+# spending the two infra requeues in minutes. Five tries over about two hours, then a person decides.
+NET_SIGNS = re.compile(r"ssh: connect to host|Could not resolve host|Connection (timed out|refused|reset|closed)|"
+                       r"Operation timed out|Network is unreachable|kex_exchange_identification|"
+                       r"unable to access '.*': (Failed to connect|Could not resolve)")
+NET_BACKOFF_S = (60, 300, 900, 1800, 3600)
 HOG_BYTES = 3 * 1024 ** 3
 OURS_CGROUP = ("sluicy-gate", "sluicy-preflight", "sluicy-worker", "sluicy-conduct")
 # A person's own apps are not workloads a session can cap (the first live run flagged Chrome showing the Deck).
@@ -1681,6 +1689,24 @@ def conduct_tickets(conn, state, sessions, now):
             done.add(key)  # the owner already moved on
             continue
         owner = owner_of(t["source"], sessions)
+        if kind == "infra" and NET_SIGNS.search(t["detail"] or ""):
+            chain = requeue_chain(conn, t)
+            if chain < len(NET_BACKOFF_S):
+                if now - t["updated_at"] < NET_BACKOFF_S[chain]:
+                    continue  # not yet: the next pass looks again, nothing recorded
+                tid = submit_ticket(conn, t["branch"], t["sha"], t["source"], t["mode"], components_of(t), t["recreate"],
+                                    json.loads(t["waivers"]), f"requeue:{t['id']}:conductor")
+                set_ticket(conn, tid, waived_by=t["waived_by"])
+                add_note(conn, t, f"Network failure ({t['detail'][:120]}). Retried after {NET_BACKOFF_S[chain] // 60} min "
+                         f"as ticket {tid}; wait on {tid}.")
+                spawn_worker()
+            else:
+                add_note(conn, t, f"Network failure ({t['detail'][:120]}) on {chain + 1} tries over two hours. "
+                         "Check that this machine reaches the remote, then `sluicy requeue`.")
+                alert(f"ticket {t['id']} ({t['branch']}): the remote stayed unreachable for {chain + 1} tries")
+            done.add(key)
+            acted.append(key)
+            continue
         if kind == "infra":
             if requeue_chain(conn, t) < MAX_REQUEUES and memory_ok():
                 waived_by = t["waived_by"]
@@ -1706,6 +1732,24 @@ def conduct_tickets(conn, state, sessions, now):
         acted.append(key)
     state["done"] = sorted(done)[-2000:]
     return acted
+
+
+def resolve_fixed(conn):
+    """A red whose branch merged later is history, not a problem: mark it superseded by that merge, so the
+    queue and the Deck show only what is still open. Returns the ids it closed."""
+    rows = conn.execute(
+        "SELECT r.id, m.id AS mid, m.sha AS msha FROM tickets r JOIN tickets m "
+        "ON m.project = r.project AND m.branch = r.branch AND m.id > r.id AND m.state IN ('merged', 'live') "
+        "WHERE r.state IN ('failed', 'conflict') ORDER BY r.id, m.id").fetchall()
+    closed = {}
+    for r in rows:
+        closed.setdefault(r["id"], (r["mid"], r["msha"]))
+    for rid, (mid, msha) in closed.items():
+        conn.execute("UPDATE tickets SET state = 'superseded', detail = ?, updated_at = ? "
+                     "WHERE id = ? AND state IN ('failed', 'conflict')",
+                     (f"superseded by {mid} ({msha[:8]}): the branch merged", time.time(), rid))
+    conn.commit()
+    return sorted(closed)
 
 
 def map_hint(t):
@@ -2020,7 +2064,8 @@ def cmd_conduct(_args):
     state = conduct_state()
     sessions = agents()
     jobs = job_sessions()
-    acted = conduct_tickets(conn, state, sessions, now) + conduct_hogs(conn, state, sessions)
+    acted = [f"{i}:resolved" for i in resolve_fixed(conn)]
+    acted += conduct_tickets(conn, state, sessions, now) + conduct_hogs(conn, state, sessions)
     try:
         if wants_map(conn):
             spawn_map()

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# The gate: every check runs here, on this machine, before anything reaches main. No GitHub Actions.
+# Install once per clone: git config core.hooksPath .githooks
+# sluicy pushes through this hook. Only a push to the main branch is gated; a branch push (a preview) is not.
+set -euo pipefail
+main="${GATE_BRANCH:-main}"
+gated=""
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  if [ "$remote_ref" = "refs/heads/$main" ] && [ "$local_sha" != "0000000000000000000000000000000000000000" ]; then
+    gated=1
+  fi
+done
+[ -n "$gated" ] || exit 0
+
+# With sluicy's guards on, only the queue's own push reaches main.
+if command -v sluicy > /dev/null && [ -e "${SLUICY_HOME:-$HOME/.local/state/sluicy}/guards-on" ]; then
+  sluicy guard push "$(git rev-parse HEAD)"
+fi
+
+# Refuse a push that would drop someone else's commits.
+git fetch -q origin "$main" 2> /dev/null || true
+if git rev-parse -q --verify "origin/$main" > /dev/null && ! git merge-base --is-ancestor "origin/$main" HEAD; then
+  echo "✗ origin/$main has commits this push lacks: merge it first" >&2
+  exit 1
+fi
+
+# One gate per machine. flock on Linux; macOS has no flock, so an atomic mkdir lock stands in.
+lock="${TMPDIR:-/tmp}/$(basename "$(git rev-parse --show-toplevel)")-gate.lock"
+if command -v flock > /dev/null; then
+  exec 9> "$lock"
+  flock 9
+else
+  until mkdir "$lock.d" 2> /dev/null; do
+    pid="$(cat "$lock.d/pid" 2> /dev/null || true)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then
+      rm -rf "$lock.d"
+      continue
+    fi
+    sleep 2
+  done
+  echo $$ > "$lock.d/pid"
+  trap 'rm -rf "$lock.d"' EXIT
+fi
+
+scripts/ci.sh
+echo "✓ Pre-push CI passed, pushing"

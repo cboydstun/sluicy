@@ -1,0 +1,22 @@
+# A repository whose checks used to run in GitHub Actions, now gated on this machine by sluicy.
+# Copy this directory's .githooks/, scripts/ci.sh and this file into the repository, then edit.
+project = "myapp"
+
+# The host (Vercel, Netlify, Cloudflare Pages) builds every push to main. If a workflow deployed for you
+# (`vercel deploy --prod` in a cd.yml), use kind = "command" with that command instead.
+[deploy]
+kind = "none"
+
+[gate]
+waivers = ["SKIP_BUILD"]
+# Machine paths differ: give each OS its own table (merged over `env` on that OS only).
+env = { TZ = "America/Chicago" }
+env_linux = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+env_darwin = { PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" }
+mem_reserve_gb = 4
+
+[deps]
+"package-lock.json" = ["npm", "ci", "--no-audit", "--no-fund"]
+
+[init]
+copy_files = [".env.local"]

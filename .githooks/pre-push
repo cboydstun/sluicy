@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# sluicy's own gate: every suite (tests/run.sh) runs on this machine before a push to main. No GitHub Actions.
+# Install once per clone: git config core.hooksPath .githooks
+set -euo pipefail
+gated=""
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ] && [ "$local_sha" != "0000000000000000000000000000000000000000" ]; then
+    gated=1
+  fi
+done
+[ -n "$gated" ] || exit 0
+nice -n 10 bash "$(git rev-parse --show-toplevel)/tests/run.sh"
