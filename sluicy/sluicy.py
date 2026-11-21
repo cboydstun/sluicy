@@ -223,11 +223,10 @@ def clean_env(extra=None):
     names, prefixes = set(BASE_GATE_VARS), ("GATE_",)
     if P is not None:
         g = P.cfg["gate"]
-        names |= set(g["waivers"]) | set(g["strip_env"]) | set(g["env"]) | set(P.cfg["preflight"]["env"])
+        # PATH from `[gate.env*]` is not stripped: it applies to the push alone, and preflight, the map and
+        # the worker still need the one they were started with. Named in strip_env, it is stripped as before.
+        names |= set(g["waivers"]) | set(g["strip_env"]) | (set(g["env"]) - {"PATH"}) | set(P.cfg["preflight"]["env"])
         prefixes = tuple(g["strip_prefixes"])
-    # PATH is never stripped: a `[gate.env*]` PATH applies to the push alone, and preflight, the map and the
-    # worker still need the one they were started with.
-    names.discard("PATH")
     env = {k: v for k, v in os.environ.items() if k not in names and not (prefixes and k.startswith(prefixes))}
     env.update(extra or {})
     return env
@@ -574,10 +573,11 @@ def run_gated_push(conn, tid, env, log):
                 deadline = braked_at + 30
                 while group_alive(proc.pid) and time.monotonic() < deadline:
                     time.sleep(0.5)
-                try:
-                    os.killpg(proc.pid, 9)
-                except OSError:  # gone, or not ours to signal
-                    pass
+                if group_alive(proc.pid):  # not when it is gone: the pgid could be reused
+                    try:
+                        os.killpg(proc.pid, 9)
+                    except OSError:
+                        pass
             sweep_gate(log, started)
             return reason
         time.sleep(poll)
@@ -1771,9 +1771,15 @@ def our_roots():
     for v in ("SLUICY_PREFLIGHT_DIR", "SLUICY_MAP_DIR"):
         if os.environ.get(v):
             roots.append(os.environ[v])
+    # Read-only and no schema work: this runs from read paths (hogs, leftovers) beside the caller's own conn.
+    path = Path(os.environ.get("SLUICY_DB") or home() / "sluicy.db")
     try:
-        for row in db().execute("SELECT checkout FROM projects"):
-            roots += [row["checkout"], f"{row['checkout']}-preflight", f"{row['checkout']}-map"]
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            for (co,) in conn.execute("SELECT checkout FROM projects"):
+                roots += [co, f"{co}-preflight", f"{co}-map"]
+        finally:
+            conn.close()
     except sqlite3.Error:
         pass
     return roots

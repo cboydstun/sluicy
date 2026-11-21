@@ -8,7 +8,9 @@
 #
 # Then, in each repository: add a .sluicy.toml (see examples/) and run `sluicy init`.
 set -euo pipefail
-root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# The script itself resolved (it may be run through a symlink). BSD readlink has -f only from macOS 12.3.
+self="$(readlink -f "${BASH_SOURCE[0]}" 2> /dev/null || python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+root="$(cd "$(dirname "$self")" && pwd)"
 hooks=1
 deck=1
 for arg in "$@"; do

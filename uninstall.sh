@@ -2,7 +2,9 @@
 # Undo install.sh: the commands, the timer, the gate slice and the Claude Code hooks. The queue's state
 # (~/.local/state/sluicy) and the project checkouts (~/.local/share/sluicy) are kept; delete them by hand.
 set -euo pipefail
-root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# The script itself resolved (it may be run through a symlink). BSD readlink has -f only from macOS 12.3.
+self="$(readlink -f "${BASH_SOURCE[0]}" 2> /dev/null || python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+root="$(cd "$(dirname "$self")" && pwd)"
 bin="$HOME/.local/bin"
 for name in sluicy plan-review deck; do
     if [ -L "$bin/$name" ] && [[ "$(readlink "$bin/$name")" == "$root"/* ]]; then

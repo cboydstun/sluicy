@@ -318,7 +318,7 @@ class ReviewFixes(unittest.TestCase):
         code = (
             "import sluicy, os, time\n"
             "conn = sluicy.db()\n"
-            "conn.execute(\"INSERT INTO projects VALUES ('p', '/src/p', '/work/p-co', ?)\", (time.time(),))\n"
+            "conn.execute(\"INSERT OR IGNORE INTO projects VALUES ('p', '/src/p', '/work/p-co', ?)\", (time.time(),))\n"
             "conn.commit()\n"
             "print('roots', sluicy.our_roots())\n"
             "class C: cfg = {'gate': {'waivers': [], 'strip_env': [], 'env': {'PATH': '/x'}, 'strip_prefixes': []},"
@@ -331,6 +331,10 @@ class ReviewFixes(unittest.TestCase):
         self.assertIn("/work/p-co-preflight", res.stdout, res.stderr)
         self.assertIn("/work/p-co-map", res.stdout)
         self.assertIn("path True", res.stdout)
+        # Named in strip_env, PATH is still stripped.
+        code2 = code.replace("'strip_env': []", "'strip_env': ['PATH']")
+        res = subprocess.run([sys.executable, "-c", code2], env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("path False", res.stdout, res.stderr)
 
 
 class MemoryReadFailure(unittest.TestCase):
