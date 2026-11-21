@@ -213,8 +213,9 @@ class Sweep(unittest.TestCase):
         try:
             run = runner({
                 # 999999: a person's shell `cd`'d into the checkout, on a terminal; never killed.
-                "ps -axo pid=,tty=": f"{child.pid} ??\n{os.getpid()} ??\n999999 ttys001\n",
-                "ps -axo": f"{child.pid} {child.pid} 100 sleep 60\n{os.getpid()} 1 100 python3\n999999 999999 100 -zsh\n",
+                # ppid 1: launchd adopted it (its real parent is this runner; only the fake ppid counts).
+                "ps -axo pid=,ppid=": f"{child.pid} 1 ?? 00:01\n{os.getpid()} 1 ?? 00:01\n999999 1 ttys001 00:01\n",
+                "ps -o": f"{child.pid} 00:01\n",
                 "lsof": f"p{child.pid}\nn{root}\np{os.getpid()}\nn{root}\np999999\nn{root}/apps\n",
             })
             log = io.StringIO()
@@ -228,8 +229,7 @@ class Sweep(unittest.TestCase):
                 child.kill()
 
     def test_kill_in_leaves_other_directories_alone(self):
-        run = runner({"ps -axo pid=,tty=": "4242 ??\n", "ps -axo": "4242 4242 100 vim\n",
-                      "lsof": "p4242\nn/Users/me/notes\n"})
+        run = runner({"ps -axo pid=,ppid=": "4242 1 ?? 00:01\n", "lsof": "p4242\nn/Users/me/notes\n"})
         self.assertEqual(mac.kill_in("/tmp/checkout", io.StringIO(), run=run), [])
 
 
@@ -281,8 +281,8 @@ class ReviewFixes(unittest.TestCase):
         try:
             # 777777: an editor's language server, up for an hour; 888888: age unknown. Both spared.
             run = runner({
-                "ps -axo pid=,tty=": f"{child.pid} ?? 00:01\n777777 ?? 01:00:00\n888888 ??\n",
-                "ps -axo": f"{child.pid} {child.pid} 100 sleep 60\n777777 777777 100 tsserver\n888888 888888 100 x\n",
+                "ps -axo pid=,ppid=": f"{child.pid} 1 ?? 00:01\n777777 1 ?? 01:00:00\n888888 1 ??\n",
+                "ps -o": f"{child.pid} 00:01\n",
                 "lsof": f"p{child.pid}\nn{root}\np777777\nn{root}\np888888\nn{root}\n",
             })
             log = io.StringIO()
@@ -297,7 +297,7 @@ class ReviewFixes(unittest.TestCase):
     def test_kill_in_sends_no_sigkill_to_pids_that_already_exited(self):
         root = Path(tempfile.mkdtemp())
         sent = []
-        run = runner({"ps -axo pid=,tty=": "424242 ??\n", "ps -axo": "424242 424242 100 x\n",
+        run = runner({"ps -axo pid=,ppid=": "424242 1 ?? 00:01\n", "ps -o": "424242 00:01\n",
                       "lsof": f"p424242\nn{root}\n"})
         kill, alive = mac.os.kill, mac._alive
 
@@ -335,6 +335,119 @@ class ReviewFixes(unittest.TestCase):
         code2 = code.replace("'strip_env': []", "'strip_env': ['PATH']")
         res = subprocess.run([sys.executable, "-c", code2], env=env, capture_output=True, text=True, timeout=60)
         self.assertIn("path False", res.stdout, res.stderr)
+
+
+class KillInResiduals(unittest.TestCase):
+    """kill_in decides by ancestry and age from one ps read, re-checks each pid before signalling, and says
+    so when it cannot read processes. Fake pids are above Linux's pid_max and never reach a real kill."""
+
+    A, B, C = 5000001, 5000002, 5000003
+
+    def setUp(self):
+        self.root = os.path.realpath(tempfile.mkdtemp())
+        self.sent = []
+        self._kill, self._alive = mac.os.kill, mac._alive
+        mac.os.kill = lambda pid, sig: self.sent.append((pid, sig))
+        mac._alive = lambda _p: False
+
+    def tearDown(self):
+        mac.os.kill, mac._alive = self._kill, self._alive
+
+    def sweep(self, snap, inside, verify=None, outside=(), since=None, exclude=(), run=None):
+        lsof = "".join(f"p{p}\nn{self.root}/apps\n" for p in inside)
+        lsof += "".join(f"p{p}\nn/Users/me\n" for p in outside)
+        if verify is None:
+            verify = "".join(f"{line.split()[0]} {line.split()[3]}\n" for line in snap.splitlines()
+                             if len(line.split()) > 3)
+        run = run or runner({"ps -axo pid=,ppid=": snap, "ps -o": verify, "lsof": lsof})
+        self.log = io.StringIO()
+        return mac.kill_in(self.root, self.log, exclude=exclude, run=run, wait=0.1, since=since)
+
+    def ago(self, secs):
+        return __import__("time").time() - secs
+
+    def test_a_child_of_a_process_older_than_the_gate_is_spared(self):
+        # An editor (up 2 h, working elsewhere) started a language server in the checkout mid-push.
+        snap = f"{self.A} 1 ?? 02:00:00\n{self.B} {self.A} ?? 00:05\n"
+        self.assertEqual(self.sweep(snap, [self.B], outside=[self.A], since=self.ago(60)), [])
+        self.assertIn(f"leaving 1 process(es) in {self.root}", self.log.getvalue())
+        self.assertEqual(self.sent, [])
+
+    def test_a_child_of_a_terminal_process_is_spared(self):
+        snap = f"{self.A} 1 ttys001 00:05\n{self.B} {self.A} ?? 00:05\n"
+        self.assertEqual(self.sweep(snap, [self.B], outside=[self.A], since=self.ago(60)), [])
+
+    def test_a_child_of_this_runner_is_spared_when_the_runner_predates_the_gate(self):
+        snap = f"{os.getpid()} 1 ?? 05:00:00\n{self.B} {os.getpid()} ?? 00:05\n"
+        self.assertEqual(self.sweep(snap, [self.B], since=self.ago(60)), [])
+
+    def test_an_orphan_and_its_child_in_the_checkout_are_both_stopped(self):
+        snap = f"{self.A} 1 ?? 00:05\n{self.B} {self.A} ?? 00:03\n"
+        self.assertEqual(self.sweep(snap, [self.A, self.B], since=self.ago(60)), [self.A, self.B])
+        self.assertEqual(self.sent, [(self.A, mac.signal.SIGTERM), (self.B, mac.signal.SIGTERM)])
+
+    def test_a_new_supervisor_that_left_the_checkout_shields_nothing(self):
+        snap = f"{self.A} 1 ?? 00:10\n{self.B} {self.A} ?? 00:03\n"
+        self.assertEqual(self.sweep(snap, [self.B], outside=[self.A], since=self.ago(60)), [self.B])
+
+    def test_cycle_missing_parent_and_excluded_pid_stop_the_walk(self):
+        cycle = f"{self.A} {self.B} ?? 00:05\n{self.B} {self.A} ?? 00:05\n"
+        self.assertEqual(self.sweep(cycle, [self.A, self.B], since=self.ago(60)), [self.A, self.B])
+        missing = f"{self.B} 5999999 ?? 00:05\n"
+        self.assertEqual(self.sweep(missing, [self.B], since=self.ago(60)), [self.B])
+        # The worker is excluded: an old excluded parent does not shield (the walk stops there).
+        excl = f"{self.A} 1 ?? 05:00:00\n{self.B} {self.A} ?? 00:05\n"
+        self.assertEqual(self.sweep(excl, [self.A, self.B], since=self.ago(60), exclude={self.A}), [self.B])
+
+    def test_unknown_age_is_spared_even_without_since(self):
+        self.assertEqual(self.sweep(f"{self.B} 1 ??\n", [self.B]), [])
+        # In lsof's answer but not in the ps snapshot (started between the two reads): unknown age.
+        self.assertEqual(self.sweep(f"{self.A} 1 ?? 00:05\n", [self.C], since=self.ago(60)), [])
+
+    def test_unreadable_processes_stop_nothing_and_say_so(self):
+        snap = f"{self.B} 1 ?? 00:05\n"
+        for lsof in (subprocess.TimeoutExpired(["lsof"], 30), OSError("lsof missing"),
+                     subprocess.CalledProcessError(1, ["lsof"], output="")):
+            run = runner({"ps -axo pid=,ppid=": snap, "ps -o": f"{self.B} 00:05\n", "lsof": lsof})
+            self.assertEqual(self.sweep(snap, [], run=run, since=self.ago(60)), [])
+            self.assertIn("cannot check processes", self.log.getvalue())
+        run = runner({"ps -axo pid=,ppid=": subprocess.TimeoutExpired(["ps"], 30)})
+        self.assertEqual(self.sweep(snap, [], run=run), [])
+        self.assertIn("cannot check processes", self.log.getvalue())
+        self.assertEqual(self.sent, [])
+
+    def test_an_app_bundle_or_claude_session_and_their_children_are_spared(self):
+        # Launched by launchd after the gate started, no terminal: only the command tells them apart.
+        for cmd in ("/Applications/Visual Studio Code.app/Contents/MacOS/Electron", "/opt/homebrew/bin/claude --bg"):
+            snap = f"{self.A} 1 ?? 00:05 {cmd}\n{self.B} {self.A} ?? 00:03 node tsserver.js\n"
+            self.assertEqual(self.sweep(snap, [self.A, self.B], since=self.ago(60)), [], cmd)
+        self.assertEqual(self.sent, [])
+
+    def test_a_partial_lsof_read_is_logged_and_the_rest_still_checked(self):
+        snap = f"{self.B} 1 ?? 00:05\n"
+        partial = subprocess.CalledProcessError(1, ["lsof"], output=f"p{self.B}\nn{self.root}\n")
+        run = runner({"ps -axo pid=,ppid=": snap, "ps -o": f"{self.B} 00:05\n", "lsof": partial})
+        self.assertEqual(self.sweep(snap, [], run=run, since=self.ago(60)), [self.B])
+        self.assertIn("some processes could not be inspected", self.log.getvalue())
+
+    def test_a_pid_reused_after_the_snapshot_is_not_signalled(self):
+        snap = f"{self.B} 1 ?? 00:05\n"
+        self.assertEqual(self.sweep(snap, [self.B], verify=f"{self.B} 00:00\n", since=self.ago(60)), [])
+        gone = subprocess.CalledProcessError(1, ["ps"], output="")
+        self.assertEqual(self.sweep(snap, [self.B], verify=gone, since=self.ago(60)), [])
+        self.assertEqual(self.sent, [])
+
+    def test_a_pid_swapped_after_sigterm_gets_no_sigkill(self):
+        snap = f"{self.B} 1 ?? 00:05\n"
+        answers = [f"{self.B} 00:05\n", f"{self.B} 00:00\n"]  # second read: a new process on that pid
+        base = runner({"ps -axo pid=,ppid=": snap, "lsof": f"p{self.B}\nn{self.root}\n"})
+
+        def run(argv):
+            return answers.pop(0) if argv[1] == "-o" else base(argv)
+
+        mac._alive = lambda _p: True
+        self.assertEqual(self.sweep(snap, [self.B], run=run, since=self.ago(60)), [self.B])
+        self.assertEqual(self.sent, [(self.B, mac.signal.SIGTERM)])
 
 
 class MemoryReadFailure(unittest.TestCase):

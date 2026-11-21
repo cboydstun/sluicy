@@ -17,8 +17,11 @@
     policy. The agent runs at standard priority, and the gate itself runs at nice 10, as Linux's scope does.
   - A brake or an orphaned push also stops processes that left the gate's process group but still work
     in the ticket's checkout (dev servers, test databases). It runs after the group has had its 30 s to
-    exit, and never touches a process on a terminal (your shell) or one that started before the push (an
-    editor's language server, a background Claude session).
+    exit, and never touches a process on a terminal (your shell), one that started before the push (an
+    editor's language server, a background Claude session), an app bundle or Claude session started
+    during it, or anything those started. It decides from one `ps` read plus `lsof`, re-checks each process's start time just before signalling it (so a
+    reused pid is left alone), and logs it when `ps` or `lsof` can't be read instead of silently stopping
+    nothing.
   - The launch agent uses Homebrew's unversioned `python3` link when it is the same interpreter, so a
     Python upgrade doesn't strand it. `bootstrap` retries once while the old job unloads.
   - A memory figure the governor can't read alerts once, and if it happens during a gate it says the brake is off.

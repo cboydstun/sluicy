@@ -14,6 +14,7 @@ Every reader takes `run` (argv -> stdout) so the tests can feed it canned output
 """
 import os
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
@@ -123,13 +124,7 @@ def read_proc(run=_run, ours=()):
         procs[pid] = [pgrp, rss, "", "", parts[3].strip() if len(parts) > 3 else ""]
     # This user's processes only (the only ones sluicy may signal). lsof exits 1 when it could not inspect
     # some process even though the rest of its output is complete, so a non-zero exit keeps what it printed.
-    argv = [_tool("lsof"), "-nP", "-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"]
-    try:
-        cwds = _lsof_cwds(run(argv))
-    except subprocess.CalledProcessError as e:
-        cwds = _lsof_cwds(e.stdout or "")
-    except (OSError, subprocess.TimeoutExpired):
-        cwds = {}
+    cwds, _err, _note = _read_cwds(run)
     # lsof reports resolved paths (/private/tmp, a symlinked ~/coding resolved), so compare resolved roots.
     roots = [os.path.realpath(str(r)).rstrip("/") for r in ours if r]
     for pid, p in procs.items():
@@ -137,6 +132,22 @@ def read_proc(run=_run, ours=()):
         if p[3] and any(p[3] == r or p[3].startswith(r + "/") for r in roots):
             p[2] = "sluicy-gate"
     return {pid: tuple(p) for pid, p in procs.items()}
+
+
+def _read_cwds(run):
+    """({pid: cwd}, error or None) for this user's processes (the only ones sluicy may signal). lsof exits 1
+    when it could not inspect some process even though the rest of its output is complete, so a non-zero
+    exit keeps what it printed; a non-zero exit that printed nothing is an error."""
+    argv = [_tool("lsof"), "-nP", "-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"]
+    try:
+        return _lsof_cwds(run(argv)), None, None
+    except subprocess.CalledProcessError as e:
+        cwds = _lsof_cwds(e.stdout or "")
+        if not cwds:
+            return {}, f"lsof exited {e.returncode} with no output", None
+        return cwds, None, f"lsof exited {e.returncode}: some processes could not be inspected"
+    except (OSError, subprocess.SubprocessError) as e:
+        return {}, f"lsof: {e}", None
 
 
 def _lsof_cwds(out):
@@ -214,60 +225,128 @@ def _etime(text):
         return None
 
 
-def _ttys(run):
-    """{pid: (tty, age_seconds or None)} from ps; "??" is no controlling terminal."""
-    out = {}
-    for line in run([_tool("ps"), "-axo", "pid=,tty=,etime="]).splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].isdigit():
-            out[int(parts[0])] = (parts[1], _etime(parts[2]) if len(parts) > 2 else None)
+def _snapshot(run):
+    """{pid: (ppid, tty, start_epoch or None, command)} from one ps read; "??" is no controlling terminal."""
+    now, out = time.time(), {}
+    for line in run([_tool("ps"), "-axo", "pid=,ppid=,tty=,etime=,command="]).splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        age = _etime(parts[3]) if len(parts) > 3 else None
+        out[int(parts[0])] = (int(parts[1]), parts[2], None if age is None else now - age,
+                              parts[4].strip() if len(parts) > 4 else "")
     return out
+
+
+# Never a gate's: an app bundle (an editor, its helpers) or a Claude Code session, and what they start.
+_PERSON = re.compile(r"^/(System/)?Applications/[^\n]*?\.app/Contents/|^(\S*/)?claude( |$)")
+
+
+def _verify(run, starts):
+    """The pids of `starts` ({pid: start_epoch}) still running with the same start (±2 s; ps's etime is in
+    whole seconds), read again just before signalling, so a pid reused since the snapshot is left alone.
+    Raises OSError/SubprocessError when ps cannot be read at all."""
+    if not starts:
+        return []
+    argv = [_tool("ps"), "-o", "pid=,etime=", "-p", ",".join(map(str, sorted(starts)))]
+    try:
+        out = run(argv)
+    except subprocess.CalledProcessError as e:
+        out = e.stdout or ""  # ps exits 1 when none of the pids is left
+    now, same = time.time(), []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        pid, age = int(parts[0]), _etime(parts[1])
+        if pid in starts and age is not None and abs((now - age) - starts[pid]) <= 2:
+            same.append(pid)
+    return sorted(same)
 
 
 def kill_in(root, log, exclude=(), run=_run, wait=10.0, since=None):
     """Stop what a gate left running under `root` (the ticket's checkout): there is no scope to stop on
     macOS, and a gate's dev servers, test databases or emulators can leave its process group. Run it
-    after the gate's own group is gone. Spared, and logged: a process with a terminal (a person's shell
-    `cd`'d into the checkout), and, given `since` (epoch seconds the gate started), anything that started
-    before it or whose age ps cannot tell (an editor's language server, a background Claude session).
-    Returns the pids it signalled."""
+    after the gate's own group is gone.
+
+    A process working under `root` is stopped only when it, and every ancestor up to launchd, is new: off
+    a terminal, of known age, and (given `since`, epoch seconds the gate started) started after the gate.
+    An app bundle's process (an editor and its helpers) or a Claude Code session counts as old whatever its
+    age. So a person's shell, an editor's language server and anything an editor or Claude session started
+    mid-push are spared and logged, while this gate's leftovers, which launchd adopts once the gate is gone,
+    still go. Leftovers older than `since` (an earlier gate's) are spared too: the safe direction.
+    Still not told apart: a process with no terminal, started during the push by launchd itself, that is
+    neither an app bundle nor `claude`, working in sluicy's own checkout. The ancestor walk stops at pid 1, an excluded pid, a pid the
+    snapshot does not hold, or a cycle; an ancestor's working directory does not matter.
+
+    One ps snapshot (with lsof for working directories) decides, and each pid is read again just before SIGTERM and before SIGKILL and skipped
+    unless its start time still matches. What is left: the milliseconds between that read and the signal,
+    and a pid reused within 2 s of the original's start. When ps or lsof cannot be read, nothing is stopped
+    and the log says so. Returns the pids it signalled."""
     root = os.path.realpath(str(root)).rstrip("/")
+    exclude = set(exclude)
     try:
-        procs = read_proc(run=run, ours=[root])
-        ttys = _ttys(run)
-    except (OSError, subprocess.SubprocessError):
+        snap = _snapshot(run)
+    except (OSError, subprocess.SubprocessError) as e:
+        snap, err = None, f"ps: {e}"
+    note = None
+    if snap is not None:
+        cwds, err, note = _read_cwds(run)
+    if err:
+        log.write(f"sluicy: cannot check processes in {root} ({err}); nothing stopped\n")
+        log.flush()
         return []
-    inside = [pid for pid, p in procs.items() if p[2] == "sluicy-gate" and pid not in exclude and pid > 1]
-    max_age = None if since is None else time.time() - since + 2  # 2 s: ps rounds etime down to the second
+    if note:
+        log.write(f"sluicy: {note}; checking the rest in {root}\n")
+    inside = sorted(pid for pid, cwd in cwds.items()
+                    if (cwd == root or cwd.startswith(root + "/")) and pid > 1 and pid not in exclude)
+    cutoff = None if since is None else since - 2  # 2 s: ps rounds etime down to the second
+
+    def old(pid):
+        _ppid, tty, start, cmd = snap.get(pid, (0, "??", None, ""))
+        if tty not in ("??", "?", "-") or _PERSON.search(cmd):
+            return True
+        return start is None or (cutoff is not None and start < cutoff)
 
     def spared(pid):
-        tty, age = ttys.get(pid, ("??", None))
-        if tty not in ("??", "?", "-"):
+        if old(pid):
             return True
-        return max_age is not None and (age is None or age > max_age)
+        seen, p = {pid}, snap[pid][0]
+        while p > 1 and p not in exclude and p in snap and p not in seen:
+            if old(p):
+                return True
+            seen.add(p)
+            p = snap[p][0]
+        return False
 
-    kept = sorted(pid for pid in inside if spared(pid))
-    left = sorted(pid for pid in inside if pid not in kept)
+    kept = [pid for pid in inside if spared(pid)]
+    left = [pid for pid in inside if pid not in kept]
     if kept:
-        log.write(f"sluicy: leaving {len(kept)} process(es) in {root} (on a terminal or older than the gate): "
-                  f"{' '.join(map(str, kept))}\n")
+        log.write(f"sluicy: leaving {len(kept)} process(es) in {root} (on a terminal, older than the gate, "
+                  f"or started by one): {' '.join(map(str, kept))}\n")
     if not left:
         log.flush()
         return []
+    starts = {pid: snap[pid][2] for pid in left}
     log.write(f"sluicy: stopping {len(left)} process(es) left in {root}: {' '.join(map(str, left))}\n")
     log.flush()
+    signalled = []
     for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            targets = _verify(run, {p: starts[p] for p in left})
+        except (OSError, subprocess.SubprocessError) as e:
+            log.write(f"sluicy: cannot re-check processes in {root} (ps: {e}); not signalling them\n")
+            log.flush()
+            break
         alive = []
-        for pid in left:
+        for pid in targets:
             try:
                 os.kill(pid, sig)
                 alive.append(pid)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
+                signalled.append(pid)
+            except (ProcessLookupError, PermissionError):
                 pass
         if sig == signal.SIGTERM:
-            signalled = alive
             deadline = time.monotonic() + wait
             while time.monotonic() < deadline and any(_alive(p) for p in alive):
                 time.sleep(0.2)
