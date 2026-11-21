@@ -74,6 +74,38 @@ cargo it downloads the deck from the latest release; elsewhere install Rust and 
 4. Give the repository a gate: a `.githooks/pre-push` (or any `pre-push` hook) that runs your checks
    and fails the push when they fail. sluicy pushes through it; it does not replace it.
 
+### Moving off GitHub Actions
+
+sluicy is built for gating on your own machine, so a repository needs no hosted CI. To move one over:
+
+1. Copy [`examples/local-gate/`](examples/local-gate) into the repository:
+   - `.githooks/pre-push` gates only pushes to main and runs one gate per machine (`flock` on Linux, a
+     `mkdir` lock on macOS);
+   - `scripts/ci.sh` runs each stage when its files changed;
+   - `scripts/install.sh` installs dependencies for `[deps]` and `sluicy init`;
+   - `.sluicy.toml` is a starting config.
+2. Put each workflow's steps into `scripts/ci.sh`, together with the env they set (`TZ`, `NODE_OPTIONS`,
+   placeholder secrets).
+   - The worker, `[deps]`, `init` and the gate all start with a bare PATH, and `[gate] env` reaches only
+     the gate. Tool lookup (Homebrew, fnm, nvm) therefore lives in `scripts/toolchain.sh`, which the
+     other scripts source.
+   - A service container (Postgres, MongoDB) becomes a local server or an in-memory test server.
+3. If a workflow deployed (`vercel deploy --prod`), either turn on the host's Git integration
+   (`kind = "none"`) or move that command to `[deploy] command`.
+4. Delete `.github/workflows/`, then run `git config core.hooksPath .githooks` and `sluicy init`.
+5. Turn Actions off for the repository, so a stray workflow on an old branch can't run:
+   `gh api -X PUT repos/<owner>/<repo>/actions/permissions -F enabled=false`.
+
+### What the queue shows
+
+`sluicy status` and the deck show what is still open. `alerts.log` keeps everything.
+
+- A failed ticket whose branch merges later is marked `superseded` by the conductor.
+- The deck hides alerts about tickets that have merged or been replaced.
+- It drops alerts that name no ticket after a day.
+- A network failure (GitHub unreachable, DNS) is retried after 1, 5, 15, 30 and 60 minutes before a
+  person is asked.
+
 Then:
 
 ```bash

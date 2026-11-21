@@ -1579,6 +1579,55 @@ class Conduct(Base):
         self.assertEqual(self.conduct(), [])  # idempotent
         self.assertEqual(self.db().execute("SELECT COUNT(*) FROM tickets").fetchone()[0], 2)
 
+    def test_a_red_whose_branch_merged_later_is_superseded(self):
+        old = self.submit("fix/later", "--ride")
+        self.set_state(old, "failed", "worker error: FileNotFoundError: 'corepack'")
+        other = self.submit("fix/other", "--ride")
+        self.set_state(other, "failed", "gate or push failed; log x")
+        new = self.submit("fix/later", "--ride")
+        self.set_state(new, "merged", "")
+        self.assertIn(f"{old}:resolved", self.conduct())
+        t = self.ticket(old)
+        self.assertEqual(t["state"], "superseded")
+        self.assertTrue(t["detail"].startswith(f"superseded by {new} ("), t["detail"])
+        self.assertEqual(self.ticket(other)["state"], "failed")  # still open: its branch never merged
+        self.assertNotIn(f"{old}:resolved", self.conduct())  # idempotent
+
+    def test_a_network_red_backs_off_then_retries(self):
+        tid = self.submit("fix/net", "--ride")
+        err = "worker error: git fetch -q origin main: ssh: connect to host github.com port 22: Undefined error: 0"
+        self.set_state(tid, "failed", err)
+        self.assertEqual(self.conduct(), [])  # under a minute old: wait
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM tickets").fetchone()[0], 1)
+        self.set_state(tid, "failed", err, age=120)
+        self.assertIn(f"{tid}:infra", self.conduct())
+        self.assertIn("Network failure", self.ticket(tid)["notes"])
+        new = self.db().execute("SELECT * FROM tickets WHERE id > ?", (int(tid),)).fetchone()
+        self.assertEqual(new["submitted_by"], f"requeue:{tid}:conductor")
+        # The second try waits five minutes, not one.
+        self.set_state(new["id"], "failed", err, age=120)
+        self.assertEqual(self.conduct(), [])
+        self.set_state(new["id"], "failed", err, age=400)
+        self.assertIn(f"{new['id']}:infra", self.conduct())
+
+    def test_alerts_are_one_line_each(self):
+        tid = self.submit("fix/lines", "--ride")
+        c = self.db()
+        for _ in range(len(load_tool().NET_BACKOFF_S)):
+            prev = tid
+            c.execute("INSERT INTO tickets (branch, sha, source, mode, components, recreate, waivers, submitted_by, "
+                      "state, detail, created_at, updated_at, project) SELECT branch, sha, source, mode, components, "
+                      "recreate, waivers, 'requeue:' || id || ':conductor', 'queued', '', created_at, updated_at, project "
+                      "FROM tickets WHERE id = ?", (prev,))
+            c.commit()
+            tid = c.execute("SELECT MAX(id) FROM tickets").fetchone()[0]
+        self.set_state(tid, "failed", "worker error: ssh: connect to host github.com port 22\nfatal: Could not read\n\nmore",
+                       age=7200)
+        self.conduct()
+        lines = [l for l in self.alerts().splitlines() if "unreachable" in l]
+        self.assertEqual(len(lines), 1, self.alerts())
+        self.assertNotIn("\n", lines[0])
+
     def test_infra_red_is_not_requeued_when_memory_is_short(self):
         self.set_memory(4)
         tid = self.submit("fix/mem", "--ride")

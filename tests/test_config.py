@@ -103,8 +103,10 @@ class Validate(unittest.TestCase):
         self.bad('project = "x"\n[graph]\ngraphh = 1', "unknown key 'graphh'")
 
     def test_examples_are_valid(self):
-        for f in sorted((ROOT / "examples").glob("*.toml")):
-            with self.subTest(f.name):
+        files = sorted((ROOT / "examples").rglob("*.toml"))
+        self.assertIn(ROOT / "examples" / "local-gate" / ".sluicy.toml", files)
+        for f in files:
+            with self.subTest(str(f.relative_to(ROOT))):
                 config.load(f)
 
     def test_find_stops_at_the_given_root(self):

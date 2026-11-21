@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The queue shows only what is open:
+  - the conductor marks a failed or conflicted ticket `superseded` once a later ticket on its branch
+    merges;
+  - the deck hides alerts about merged, live, superseded or cancelled tickets, expires alerts with no
+    ticket after 24 hours, and folds old multi-line alerts into one line;
+  - `alert()` now writes one line per alert.
+- Network failures in the worker (ssh connect, DNS, timeouts) back off and retry after 1, 5, 15, 30 and
+  60 minutes, instead of using up the two infra requeues within minutes.
+- `examples/local-gate/` (a pre-push gate, a `ci.sh` skeleton and a `.sluicy.toml`) for moving a
+  repository off GitHub Actions, and a README section on doing it.
+
 - macOS support (`platform_macos`). Gates run uncapped, and the memory governor brakes them from the
   kernel's memorystatus figures. Workers run as detached processes, the conductor timer is a launchd
   agent, and `ps`/`lsof` stand in for `/proc`. `install.sh` and `uninstall.sh` accept Darwin.

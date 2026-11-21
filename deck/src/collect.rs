@@ -981,6 +981,78 @@ pub fn map_summary(impact: &Value, current: bool) -> String {
     out
 }
 
+/// An alert about a ticket that has since merged, gone live or been replaced is history; one with no ticket
+/// (a memory hog, a cleanup count) is old news after a day. Neither belongs on the Deck: `alerts.log` keeps them.
+const ALERT_TTL_S: f64 = 86400.0;
+const TICKET_DONE: [&str; 4] = ["merged", "live", "superseded", "cancelled"];
+
+/// The alerts still worth a look, oldest first, one string each. A line that does not start with a
+/// timestamp continues the alert above it (older sluicy wrote multi-line errors), joined with " | ".
+fn open_alerts(
+    text: &str,
+    states: &HashMap<i64, String>,
+    now: f64,
+    epoch: impl Fn(&str) -> Option<f64>,
+) -> Vec<String> {
+    let stamp = |l: &str| l.get(..19).and_then(&epoch);
+    let mut groups: Vec<String> = vec![];
+    for line in lines(text) {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        match groups.last_mut() {
+            Some(g) if stamp(line).is_none() => {
+                g.push_str(" | ");
+                g.push_str(line.trim());
+            }
+            _ => groups.push(line.to_string()),
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|g| {
+            if let Some(id) = alert_ticket(g) {
+                // A ticket the database doesn't know stays: never hide what can't be placed.
+                return !states
+                    .get(&id)
+                    .is_some_and(|s| TICKET_DONE.contains(&s.as_str()));
+            }
+            match stamp(g) {
+                Some(at) => now - at < ALERT_TTL_S,
+                None => true,
+            }
+        })
+        .collect()
+}
+
+/// The ticket an alert is about: the number after its first "ticket ".
+fn alert_ticket(alert: &str) -> Option<i64> {
+    let rest = &alert[alert.find("ticket ")? + 7..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// "YYYY-MM-DD HH:MM:SS" in local time (how sluicy stamps alerts) as Unix seconds.
+fn local_epoch(stamp: &str) -> Option<f64> {
+    let b = stamp.as_bytes();
+    if b.len() != 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b' ' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| stamp.get(r)?.parse::<i32>().ok();
+    // SAFETY: a zeroed tm is valid input; mktime only reads and normalises it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = n(0..4)? - 1900;
+    tm.tm_mon = n(5..7)? - 1;
+    tm.tm_mday = n(8..10)?;
+    tm.tm_hour = n(11..13)?;
+    tm.tm_min = n(14..16)?;
+    tm.tm_sec = n(17..19)?;
+    tm.tm_isdst = -1;
+    let t = unsafe { libc::mktime(&mut tm) };
+    (t != -1).then_some(t as f64)
+}
+
 pub fn collect_queue(c: &Cfg) -> Value {
     let mut tickets = vec![];
     let mut holds = vec![];
@@ -994,15 +1066,22 @@ pub fn collect_queue(c: &Cfg) -> Value {
         t.insert("map".into(), json!(map));
     }
     let alerts_path = c.sluicy_home.join("alerts.log");
-    let alerts: Vec<String> = if alerts_path.is_file() {
-        let t = String::from_utf8_lossy(&fs::read(&alerts_path).unwrap_or_default()).into_owned();
-        let l = lines(&t);
-        l[l.len().saturating_sub(15)..]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        vec![]
+    let alerts: Vec<String> = match read_tail(&alerts_path, 256 * 1024) {
+        Some(t) => {
+            let states: HashMap<i64, String> = sluicy_db(c)
+                .map(|conn| {
+                    rows(&conn, "SELECT id, state FROM tickets")
+                        .into_iter()
+                        .filter_map(|r| {
+                            Some((r.get("id")?.as_i64()?, r.get("state")?.as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let all = open_alerts(&t, &states, util::now_secs(), local_epoch);
+            all[all.len().saturating_sub(15)..].to_vec()
+        }
+        None => vec![],
     };
     json!({
         "tickets": tickets,
@@ -1317,6 +1396,45 @@ pub fn local_branches(c: &Cfg, memo: &mut GitMemo) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_alerts_hide_history() {
+        // Fixed epochs per stamp, independent of the machine's time zone.
+        let fake = |s: &str| -> Option<f64> {
+            match s {
+                "2026-11-19 07:30:13" => Some(1000.0),
+                "2026-11-19 13:17:59" => Some(90_000.0),
+                "2026-11-19 16:00:00" => Some(95_000.0),
+                _ => None,
+            }
+        };
+        let text = "2026-11-19 07:30:13 10.1 GB outside the gate: pid 1291\n\
+                    2026-11-19 13:17:59 ticket 11 (b): worker error: ssh: connect\n\
+                    fatal: Could not read from remote repository.\n\
+                    \n\
+                    2026-11-19 13:17:59 ticket 12 (b): gate failed\n\
+                    2026-11-19 16:00:00 3 thing(s) to clean up\n\
+                    ticket 1 blocked\n";
+        let states: HashMap<i64, String> =
+            [(11, "superseded".to_string()), (12, "failed".to_string())].into_iter().collect();
+        assert_eq!(
+            open_alerts(text, &states, 100_000.0, fake),
+            vec![
+                "2026-11-19 13:17:59 ticket 12 (b): gate failed".to_string(),
+                "2026-11-19 16:00:00 3 thing(s) to clean up | ticket 1 blocked".to_string(),
+            ]
+        );
+        assert_eq!(alert_ticket("x ticket 42 (y)"), Some(42));
+        assert_eq!(alert_ticket("no tickets here"), None);
+    }
+
+    #[test]
+    fn local_epoch_reads_sluicy_stamps() {
+        let a = local_epoch("2026-11-19 07:30:13").unwrap();
+        let b = local_epoch("2026-11-19 07:30:14").unwrap();
+        assert_eq!(b - a, 1.0);
+        assert_eq!(local_epoch("ticket 1 blocked..."), None);
+    }
 
     #[test]
     fn map_summary_reads_the_impact_column() {
