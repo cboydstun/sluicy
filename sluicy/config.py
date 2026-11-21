@@ -3,7 +3,9 @@
 Standard library only (tomllib, Python 3.11+). Every key is optional except `project`; an unknown key is an
 error, so a typo never silently turns a safety check off.
 """
+import os
 import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -30,6 +32,9 @@ DEFAULTS = {
         "strip_env": [],
         "strip_prefixes": ["GATE_"],
         "env": {},
+        # Merged over `env` on that OS only, for machine paths (PATH, JAVA_HOME, SDK roots).
+        "env_linux": {},
+        "env_darwin": {},
         "mem_reserve_gb": 4.0,
         "red_line": r"^\s*✗ ",
         "case_head": r"",
@@ -68,7 +73,7 @@ class ConfigError(ValueError):
 
 
 # Tables whose keys are the user's own (names, env vars), not a fixed schema.
-FREE_TABLES = {"components", "deps", "env", "exit_codes"}
+FREE_TABLES = {"components", "deps", "env", "env_linux", "env_darwin", "exit_codes"}
 
 
 def _merge(defaults, given, where):
@@ -93,8 +98,9 @@ def _strings(value, where):
     return value
 
 
-def validate(raw, path="<config>"):
-    """A complete config dict (defaults filled in) from the parsed TOML, or ConfigError."""
+def validate(raw, path="<config>", os_name=None):
+    """A complete config dict (defaults filled in) from the parsed TOML, or ConfigError. `gate.env` comes back
+    with this OS's `gate.env_<os>` merged over it (`os_name` is sys.platform unless given)."""
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: not a table")
     cfg = _merge(DEFAULTS, raw, "")
@@ -140,9 +146,11 @@ def validate(raw, path="<config>"):
             re.compile(g[key])
         except (re.error, TypeError) as err:
             raise ConfigError(f"gate.{key}: {err}") from None
-    for table in (g["env"], cfg["preflight"]["env"]):
+    for table in (g["env"], g["env_linux"], g["env_darwin"], cfg["preflight"]["env"]):
         if not all(isinstance(k, str) and isinstance(v, str) for k, v in table.items()):
             raise ConfigError("env tables take string values")
+    os_name = os_name or os.environ.get("SLUICY_PLATFORM") or sys.platform
+    g["env"] = {**g["env"], **g.get(f"env_{'darwin' if os_name == 'darwin' else 'linux'}", {})}
     for key in ("command", "link_dirs", "exclude"):
         _strings(cfg["preflight"][key], f"preflight.{key}")
     for name, cmd in cfg["deps"].items():

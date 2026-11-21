@@ -53,7 +53,9 @@ class InstallScript(unittest.TestCase):
         (self.home / ".claude").mkdir()
         self.settings = self.home / ".claude" / "settings.json"
         self.settings.write_text(json.dumps({"hooks": {"PreToolUse": [RTK]}}))
-        self.env = {"HOME": str(self.home), "PATH": f"{fake}:{self.home / '.local/bin'}:/usr/bin:/bin",
+        # The python3 running the tests comes first: macOS's /usr/bin/python3 is too old for sluicy.
+        py = Path(sys.executable).parent
+        self.env = {"HOME": str(self.home), "PATH": f"{fake}:{self.home / '.local/bin'}:{py}:/usr/bin:/bin",
                     "SLUICY_HOME": str(self.home / "state")}
 
     def run_sh(self, name, *args):
@@ -62,7 +64,7 @@ class InstallScript(unittest.TestCase):
     def test_round_trip(self):
         res = self.run_sh("install.sh", "--no-deck")
         self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
-        self.assertIn("no systemd user session", res.stdout)
+        self.assertIn("gates are not memory-capped" if sys.platform == "darwin" else "no systemd user session", res.stdout)
         for name in ("sluicy", "plan-review", "deck"):
             self.assertTrue((self.home / ".local/bin" / name).is_symlink(), name)
         s = json.loads(self.settings.read_text())

@@ -27,7 +27,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as sconfig  # noqa: E402
 import graph as sgraph  # noqa: E402
-import platform_linux as plat  # noqa: E402
+# SLUICY_PLATFORM=linux|darwin overrides the OS (the test suite emulates Linux with fake systemd tools).
+MACOS = (os.environ.get("SLUICY_PLATFORM") or sys.platform) == "darwin"
+if MACOS:
+    import platform_macos as plat  # noqa: E402
+else:
+    import platform_linux as plat  # noqa: E402
 
 KEEPALIVE = "ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=60"
 MAX_PUSH_ATTEMPTS = 3
@@ -218,7 +223,9 @@ def clean_env(extra=None):
     names, prefixes = set(BASE_GATE_VARS), ("GATE_",)
     if P is not None:
         g = P.cfg["gate"]
-        names |= set(g["waivers"]) | set(g["strip_env"]) | set(g["env"]) | set(P.cfg["preflight"]["env"])
+        # PATH from `[gate.env*]` is not stripped: it applies to the push alone, and preflight, the map and
+        # the worker still need the one they were started with. Named in strip_env, it is stripped as before.
+        names |= set(g["waivers"]) | set(g["strip_env"]) | (set(g["env"]) - {"PATH"}) | set(P.cfg["preflight"]["env"])
         prefixes = tuple(g["strip_prefixes"])
     env = {k: v for k, v in os.environ.items() if k not in names and not (prefixes and k.startswith(prefixes))}
     env.update(extra or {})
@@ -391,7 +398,14 @@ def _env_float(name, default):
 
 
 def read_memory():
-    """{'avail_gb', 'some', 'full'}: MemAvailable and the avg10 memory pressure percentages."""
+    """{'avail_gb', 'some', 'full'}: MemAvailable and the avg10 memory pressure percentages. On macOS the
+    kernel's own figures, in the same shape (a /proc-shaped SLUICY_MEMINFO, as the tests give, still wins)."""
+    if MACOS and not os.environ.get("SLUICY_MEMINFO"):
+        try:
+            return plat.read_memory()
+        except (subprocess.SubprocessError, ValueError) as e:
+            # sysctl failing or timing out: an OSError, which every caller already treats as "unknown".
+            raise OSError(f"cannot read memory: {e}") from e
     avail_kb = None
     with open(os.environ.get("SLUICY_MEMINFO", "/proc/meminfo")) as f:
         for line in f:
@@ -438,7 +452,19 @@ def wait_for_memory(conn, t, log):
     good_since = None
     waited = False
     while True:
-        m = read_memory()
+        try:
+            m = read_memory()
+        except OSError as e:
+            good_since = None
+            detail = f"waiting for memory: {e}"[:200]
+            if not waited:
+                log.write(detail + "\n")
+                log.flush()
+                alert(f"ticket {t['id']} ({t['branch']}): {detail}")
+            waited = True
+            set_ticket(conn, t["id"], detail=detail)
+            time.sleep(poll)
+            continue
         if room_to_start(m):
             good_since = good_since or time.monotonic()
             if time.monotonic() - good_since >= settle:
@@ -474,6 +500,14 @@ def stop_gate(tid, log, project=None):
     log.flush()
 
 
+def sweep_gate(log, since):
+    """macOS, once the gate's process group is gone: no scope held its tree, so stop what it left
+    running in the checkout since the push started at `since` (see platform_macos.kill_in). Nothing to
+    do on Linux."""
+    if MACOS and P is not None:
+        plat.kill_in(checkout(), log, exclude={os.getpid()}, since=since)
+
+
 def oomd_killed_gate(tid, since):
     """True when systemd-oomd killed this ticket's gate scope since `since` (epoch seconds)."""
     return plat.oomd_killed(gate_unit_prefix(tid), since)
@@ -504,17 +538,26 @@ def run_gated_push(conn, tid, env, log):
     # Its own session, so a dead worker leaves it running: reconcile waits for this group.
     set_ticket(conn, tid, push_pgid=proc.pid)
     bad = 0
+    unread, warned = 0, False
     while proc.poll() is None:
         try:
             m = read_memory()
-        except OSError:
+            unread = 0
+        except OSError as e:
             m = None
+            unread += 1
+            if unread >= need and not warned:
+                warned = True
+                log.write(f"\nsluicy: memory unreadable ({e}); the brake is off until it reads again\n")
+                log.flush()
+                alert(f"ticket {tid}: memory unreadable during the gate ({e}); the brake is off")
         bad = bad + 1 if m and stalling(m) else 0
         if bad >= need:
             reason = f"memory pressure: {describe(m)}"
             log.write(f"\nsluicy brake: {reason}; stopping the gate\n")
             log.flush()
             stop_gate(tid, log)
+            braked_at = time.monotonic()
             try:
                 os.killpg(proc.pid, 15)
             except ProcessLookupError:
@@ -524,6 +567,18 @@ def run_gated_push(conn, tid, env, log):
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, 9)
                 proc.wait()
+            if MACOS:
+                # No scope took the group down with it: git can exit at once while browsers or a test
+                # database in its group ignore SIGTERM. Same 30 s grace, counted from the SIGTERM.
+                deadline = braked_at + 30
+                while group_alive(proc.pid) and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                if group_alive(proc.pid):  # not when it is gone: the pgid could be reused
+                    try:
+                        os.killpg(proc.pid, 9)
+                    except OSError:
+                        pass
+            sweep_gate(log, started)
             return reason
         time.sleep(poll)
     if proc.returncode != 0 and oomd_killed_gate(tid, started):
@@ -786,7 +841,8 @@ def settle_orphan_push(t):
     finish (bounded), then stop whatever is left, so the next merge never resets the checkout under it."""
     with open(t["log_path"], "a") as log:
         pgid = t["push_pgid"]
-        if pgid and group_alive(pgid):
+        orphan = bool(pgid and group_alive(pgid))
+        if orphan:
             log.write(f"\nsluicy: waiting for the previous worker's push (pgid {pgid})\n")
             log.flush()
             deadline = time.monotonic() + _env_float("SLUICY_ORPHAN_WAIT", 1200)
@@ -803,6 +859,9 @@ def settle_orphan_push(t):
                     pass
         # A gate scope can outlive its push: systemd keeps the scope when the push itself is killed.
         stop_gate(t["id"], log)
+        if orphan:
+            # updated_at is when push_pgid was written, just after the push started (minus a margin).
+            sweep_gate(log, t["updated_at"] - 5)
 
 
 def mark_live(conn, t, old_stamps=None):
@@ -1192,7 +1251,10 @@ def map_room(conn):
     """(ok, why): the map runs only on a quiet machine, so it can never compete with a gate."""
     if gate_busy(conn):
         return False, "a gate is running"
-    m = read_memory()
+    try:
+        m = read_memory()
+    except OSError as e:
+        return False, str(e)
     if m["avail_gb"] < float(P.cfg["graph"]["min_avail_gb"]) or stalling(m):
         return False, f"not enough memory ({describe(m)})"
     return True, ""
@@ -1512,6 +1574,8 @@ HOG_BYTES = 3 * 1024 ** 3
 OURS_CGROUP = ("sluicy-gate", "sluicy-preflight", "sluicy-worker", "sluicy-conduct")
 # A person's own apps are not workloads a session can cap (the first live run flagged Chrome showing the Deck).
 DESKTOP_APP = re.compile(r"(^|/)(chrome|chromium|firefox|code|gnome-shell|Xwayland|slack|spotify)( |$)")
+# A macOS app bundle (Chrome, an editor, Slack...): its path has spaces, so match the whole command line.
+MAC_APP = re.compile(r"^/(System/)?Applications/[^\n]*?\.app/Contents/")
 
 
 def conduct_state():
@@ -1700,6 +1764,34 @@ def read_proc(root):
     return procs
 
 
+def our_roots():
+    """Every directory sluicy's gates, preflights and maps work in: the default checkouts root and each
+    registered project's checkout with its -preflight and -map trees (a project may live anywhere)."""
+    roots = [str(checkouts_root())]
+    for v in ("SLUICY_PREFLIGHT_DIR", "SLUICY_MAP_DIR"):
+        if os.environ.get(v):
+            roots.append(os.environ[v])
+    # Read-only and no schema work: this runs from read paths (hogs, leftovers) beside the caller's own conn.
+    path = Path(os.environ.get("SLUICY_DB") or home() / "sluicy.db")
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            for (co,) in conn.execute("SELECT checkout FROM projects"):
+                roots += [co, f"{co}-preflight", f"{co}-map"]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    return roots
+
+
+def current_procs():
+    """Every process now, from /proc (or a /proc-shaped SLUICY_PROC); on macOS from ps and lsof."""
+    if MACOS and not os.environ.get("SLUICY_PROC"):
+        return plat.read_proc(ours=our_roots())
+    return read_proc(os.environ.get("SLUICY_PROC", "/proc"))
+
+
 def hogs(procs, sessions):
     """Process groups using ≥ 3 GB outside sluicy's own gate and preflight, with the session that owns them."""
     groups = {}
@@ -1711,7 +1803,7 @@ def hogs(procs, sessions):
             g.update(pid=pid, cwd=cwd, cmd=cmd)
     out = []
     for pgrp, g in groups.items():
-        if g["ours"] or g["rss"] < HOG_BYTES or DESKTOP_APP.search(g["cmd"].split(" ")[0]):
+        if g["ours"] or g["rss"] < HOG_BYTES or DESKTOP_APP.search(g["cmd"].split(" ")[0]) or MAC_APP.match(g["cmd"]):
             continue
         who = next((a.get("name") for a in sessions if a.get("cwd") and g["cwd"].startswith(str(a["cwd"]).rstrip("/"))), None)
         out.append({"pgrp": pgrp, "pid": g["pid"], "gb": round(g["rss"] / 1024 ** 3, 1), "cwd": g["cwd"],
@@ -1724,7 +1816,7 @@ def conduct_hogs(conn, state, sessions):
         return []
     done = set(state["done"])
     acted = []
-    for h in hogs(read_proc(os.environ.get("SLUICY_PROC", "/proc")), sessions):
+    for h in hogs(current_procs(), sessions):
         key = f"hog:{h['pgrp']}"
         if key in done:
             continue
@@ -1866,8 +1958,9 @@ def leftovers(path, main):
 
 
 def process_inside(path):
-    procs = read_proc(os.environ.get("SLUICY_PROC", "/proc"))
-    path = str(path).rstrip("/")
+    procs = current_procs()
+    # macOS's lsof reports resolved cwds (Linux /proc does too, but its tests use plain paths).
+    path = (os.path.realpath(str(path)) if MACOS else str(path)).rstrip("/")
     return next((pid for pid, p in procs.items() if p[3] == path or p[3].startswith(path + "/")), None)
 
 
@@ -2042,9 +2135,19 @@ def cmd_init(args):
 
 
 def install_conduct_timer():
-    """`sluicy conduct` every 5 minutes as a systemd user timer. Not under tests (SLUICY_HOME) or without a
-    systemd user session."""
-    if os.environ.get("SLUICY_HOME") or not shutil.which("systemctl"):
+    """`sluicy conduct` every 5 minutes: a systemd user timer, or a launchd agent on macOS. Not under tests
+    (SLUICY_HOME) or without a systemd user session."""
+    if os.environ.get("SLUICY_HOME"):
+        return
+    if MACOS:
+        try:
+            plist = plat.install_timer([plat.stable_python(sys.executable), str(worker_script()), "conduct"],
+                                       Path.home() / "Library" / "LaunchAgents", home())
+            print(f"conduct timer: on, every 5 min ({plist})")
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"conduct timer: not enabled ({str(e)[:120]})")
+        return
+    if not shutil.which("systemctl"):
         return
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
@@ -2647,7 +2750,7 @@ def cmd_scope(args):
             reserve = float(sconfig.load(f)["gate"]["mem_reserve_gb"])
     mem = plat.gate_mem_max_gb(reserve)
     argv = plat.scoped(cmd, f"sluicy-gate-manual-{os.getpid()}", mem)
-    if argv is cmd:
+    if argv is cmd or MACOS:  # macOS wraps it in `nice`, which caps nothing
         print("sluicy: no systemd user scope available; running uncapped", file=sys.stderr)
     env = {**os.environ, "SLUICY_GATE_SCOPED": "1"}
     os.execvpe(argv[0], argv, env)
@@ -2786,8 +2889,10 @@ def main():
     s = sub.add_parser("paths", help="where sluicy keeps things")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_paths)
-    s = sub.add_parser("timer", help="install the conductor's systemd user timer (install.sh runs it)")
+    s = sub.add_parser("timer", help="install the conductor's timer: systemd user timer, or launchd on macOS")
     s.set_defaults(fn=lambda _a: install_conduct_timer() or 0)
+    s = sub.add_parser("untimer", help="remove the conductor's launchd agent (macOS; uninstall.sh runs it)")
+    s.set_defaults(fn=lambda _a: (plat.remove_timer(Path.home() / "Library" / "LaunchAgents") if MACOS else None) or 0)
     s = sub.add_parser("stamps", help="what production runs, per component (for the Deck)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_stamps)

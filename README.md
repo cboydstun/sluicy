@@ -31,8 +31,15 @@ server: the worker starts when there is work and exits when the queue is empty.
 
 ## Requirements
 
-- Linux, or Windows with **WSL2** and systemd enabled (`[boot] systemd=true` in `/etc/wsl.conf`).
-  macOS is not supported yet: the brakes and scopes need systemd, cgroups and `/proc`.
+- Linux, or Windows with **WSL2** and systemd enabled (`[boot] systemd=true` in `/etc/wsl.conf`), or
+  **macOS**. On macOS there are no systemd scopes or cgroups:
+  - Gates are not memory-capped. The memory governor still brakes them and stops the gate's whole
+    process group when the kernel reports memory pressure, using `kern.memorystatus_level` and
+    `kern.memorystatus_vm_pressure_level`.
+  - Workers run as plain background processes.
+  - The conductor timer is a launchd agent (`~/Library/LaunchAgents/com.sluicy.conduct.plist`).
+  - There is no prebuilt deck binary; install Rust to build it.
+  - Put machine paths in `[gate.env_darwin]` / `[gate.env_linux]` so one `.sluicy.toml` serves both.
 - Python 3.11+, git.
 - [Claude Code](https://claude.com/claude-code) for the hooks and the deck. The queue itself works by
   hand with any tool, or none.
