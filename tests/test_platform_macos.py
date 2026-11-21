@@ -222,7 +222,7 @@ class Sweep(unittest.TestCase):
             self.assertEqual(hit, [child.pid])
             self.assertIsNotNone(child.wait(timeout=5))
             self.assertIn("stopping 1 process(es)", log.getvalue())
-            self.assertIn("leaving 1 process(es) with a terminal", log.getvalue())
+            self.assertIn("leaving 1 process(es) in", log.getvalue())
         finally:
             if child.poll() is None:
                 child.kill()
@@ -231,6 +231,106 @@ class Sweep(unittest.TestCase):
         run = runner({"ps -axo pid=,tty=": "4242 ??\n", "ps -axo": "4242 4242 100 vim\n",
                       "lsof": "p4242\nn/Users/me/notes\n"})
         self.assertEqual(mac.kill_in("/tmp/checkout", io.StringIO(), run=run), [])
+
+
+class ReviewFixes(unittest.TestCase):
+    """Fixes from the Linux-side review of the port (PR #3)."""
+
+    def test_a_failing_sysctl_does_not_fail_the_gate_cap(self):
+        # Only reported on macOS; a TimeoutExpired here used to fail the push as a worker error.
+        run = runner({"sysctl": subprocess.TimeoutExpired(["sysctl"], 30)})
+        os.environ.pop("SLUICY_GATE_MEM_MAX", None)
+        self.assertEqual(mac.gate_mem_max_gb(4, run=run), 0.0)
+
+    def test_lsof_is_this_user_only_and_a_nonzero_exit_keeps_its_output(self):
+        lsof = "p100\nfcwd\nn/Users/me/.local/share/sluicy/checkouts/gala\n"
+        run = runner({"ps -axo": Processes.PS,
+                      "lsof": subprocess.CalledProcessError(1, ["lsof"], output=lsof, stderr="lsof: no pwd entry")})
+        procs = mac.read_proc(run=run, ours=["/Users/me/.local/share/sluicy/checkouts"])
+        self.assertEqual(procs[100][3], "/Users/me/.local/share/sluicy/checkouts/gala")
+        self.assertEqual(procs[100][2], "sluicy-gate")
+        argv = next(c for c in run.calls if Path(c[0]).name == "lsof")
+        self.assertEqual(argv[argv.index("-u") + 1], str(os.getuid()))
+
+    def test_a_root_reached_through_a_symlink_matches_lsofs_resolved_cwd(self):
+        d = Path(tempfile.mkdtemp())
+        real = d / "real"
+        (real / "co").mkdir(parents=True)
+        (d / "link").symlink_to(real)
+        resolved = os.path.realpath(real / "co")
+        run = runner({"ps -axo": "500 500 100 node\n", "lsof": f"p500\nn{resolved}/apps\n"})
+        procs = mac.read_proc(run=run, ours=[str(d / "link" / "co")])
+        self.assertEqual(procs[500][2], "sluicy-gate")
+
+    def test_launch_agent_carries_the_installing_shells_path(self):
+        d = Path(tempfile.mkdtemp())
+        plist = mac.install_timer(["x"], d, d, run=runner({"launchctl": ""}), uid=501,
+                                  path="/opt/homebrew/bin:/usr/bin:/bin")
+        data = plistlib.loads(plist.read_bytes())
+        self.assertEqual(data["EnvironmentVariables"]["PATH"], "/opt/homebrew/bin:/usr/bin:/bin")
+
+    def test_etime(self):
+        self.assertEqual(mac._etime("00:05"), 5)
+        self.assertEqual(mac._etime("01:02:03"), 3723)
+        self.assertEqual(mac._etime("2-00:00:01"), 2 * 86400 + 1)
+        self.assertIsNone(mac._etime("??"))
+
+    def test_kill_in_spares_what_started_before_the_gate(self):
+        root = Path(tempfile.mkdtemp())
+        child = subprocess.Popen(["sleep", "60"], cwd=root, start_new_session=True)
+        try:
+            # 777777: an editor's language server, up for an hour; 888888: age unknown. Both spared.
+            run = runner({
+                "ps -axo pid=,tty=": f"{child.pid} ?? 00:01\n777777 ?? 01:00:00\n888888 ??\n",
+                "ps -axo": f"{child.pid} {child.pid} 100 sleep 60\n777777 777777 100 tsserver\n888888 888888 100 x\n",
+                "lsof": f"p{child.pid}\nn{root}\np777777\nn{root}\np888888\nn{root}\n",
+            })
+            log = io.StringIO()
+            hit = mac.kill_in(root, log, run=run, wait=5, since=__import__("time").time() - 60)
+            self.assertEqual(hit, [child.pid])
+            self.assertIn("777777 888888", log.getvalue())
+            self.assertIsNotNone(child.wait(timeout=5))
+        finally:
+            if child.poll() is None:
+                child.kill()
+
+    def test_kill_in_sends_no_sigkill_to_pids_that_already_exited(self):
+        root = Path(tempfile.mkdtemp())
+        sent = []
+        run = runner({"ps -axo pid=,tty=": "424242 ??\n", "ps -axo": "424242 424242 100 x\n",
+                      "lsof": f"p424242\nn{root}\n"})
+        kill, alive = mac.os.kill, mac._alive
+
+        def fake_kill(pid, sig):
+            sent.append(sig)
+            if sig == mac.signal.SIGKILL:
+                raise AssertionError("SIGKILL to a pid that had exited")
+
+        mac.os.kill, mac._alive = fake_kill, (lambda _p: False)
+        try:
+            self.assertEqual(mac.kill_in(root, io.StringIO(), run=run, wait=1), [424242])
+        finally:
+            mac.os.kill, mac._alive = kill, alive
+        self.assertEqual(sent, [mac.signal.SIGTERM])
+
+    def test_clean_env_keeps_path_and_our_roots_list_registered_checkouts(self):
+        home = tempfile.mkdtemp()
+        code = (
+            "import sluicy, os, time\n"
+            "conn = sluicy.db()\n"
+            "conn.execute(\"INSERT INTO projects VALUES ('p', '/src/p', '/work/p-co', ?)\", (time.time(),))\n"
+            "conn.commit()\n"
+            "print('roots', sluicy.our_roots())\n"
+            "class C: cfg = {'gate': {'waivers': [], 'strip_env': [], 'env': {'PATH': '/x'}, 'strip_prefixes': []},"
+            " 'preflight': {'env': {}}}\n"
+            "sluicy.P = C()\n"
+            "print('path', 'PATH' in sluicy.clean_env())\n"
+        )
+        env = {**os.environ, "SLUICY_HOME": home, "PYTHONPATH": str(ROOT / "sluicy")}
+        res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("/work/p-co-preflight", res.stdout, res.stderr)
+        self.assertIn("/work/p-co-map", res.stdout)
+        self.assertIn("path True", res.stdout)
 
 
 class MemoryReadFailure(unittest.TestCase):

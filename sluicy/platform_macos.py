@@ -70,7 +70,11 @@ def gate_mem_max_gb(reserve_gb, meminfo=None, run=_run):
     forced = os.environ.get("SLUICY_GATE_MEM_MAX")
     if forced:
         return float(forced.rstrip("Gg"))
-    total = mem_total_gb(run=run)
+    try:
+        total = mem_total_gb(run=run)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # Only reported on macOS (nothing enforces it), so a failing sysctl must not fail the push.
+        return 0.0
     return max(1.0, min(total * 0.75, total - reserve_gb))
 
 
@@ -117,11 +121,17 @@ def read_proc(run=_run, ours=()):
         except ValueError:
             continue
         procs[pid] = [pgrp, rss, "", "", parts[3].strip() if len(parts) > 3 else ""]
+    # This user's processes only (the only ones sluicy may signal). lsof exits 1 when it could not inspect
+    # some process even though the rest of its output is complete, so a non-zero exit keeps what it printed.
+    argv = [_tool("lsof"), "-nP", "-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"]
     try:
-        cwds = _lsof_cwds(run([_tool("lsof"), "-nP", "-a", "-d", "cwd", "-Fpn"]))
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        cwds = _lsof_cwds(run(argv))
+    except subprocess.CalledProcessError as e:
+        cwds = _lsof_cwds(e.stdout or "")
+    except (OSError, subprocess.TimeoutExpired):
         cwds = {}
-    roots = [str(r).rstrip("/") for r in ours if r]
+    # lsof reports resolved paths (/private/tmp, a symlinked ~/coding resolved), so compare resolved roots.
+    roots = [os.path.realpath(str(r)).rstrip("/") for r in ours if r]
     for pid, p in procs.items():
         p[3] = cwds.get(pid, "")
         if p[3] and any(p[3] == r or p[3].startswith(r + "/") for r in roots):
@@ -142,8 +152,11 @@ def _lsof_cwds(out):
     return cwds
 
 
-def install_timer(argv, agents_dir, logs_dir, run=_run, uid=None):
-    """`argv` every 5 minutes as a launchd user agent. Returns the plist path."""
+def install_timer(argv, agents_dir, logs_dir, run=_run, uid=None, path=None):
+    """`argv` every 5 minutes as a launchd user agent. Returns the plist path. `path` (default: this shell's
+    PATH) is written into the agent: launchd's own is /usr/bin:/bin:/usr/sbin:/sbin, and the conductor and
+    every worker it starts would otherwise miss Homebrew's git, node and npm and ~/.local/bin."""
+    path = os.environ.get("PATH", "") if path is None else path
     uid = os.getuid() if uid is None else uid
     agents_dir, logs_dir = Path(agents_dir), Path(logs_dir)
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +171,7 @@ def install_timer(argv, agents_dir, logs_dir, run=_run, uid=None):
         # child (no transient unit, as on Linux), inherits them and cannot drop them, so the whole gate
         # would run at nice 19 on throttled IO. The conduct pass itself is a few cheap reads.
         "ProcessType": "Standard",
+        **({"EnvironmentVariables": {"PATH": path}} if path else {}),
         "StandardOutPath": str(logs_dir / "conduct.out"),
         "StandardErrorPath": str(logs_dir / "conduct.out"),
     }))
@@ -185,33 +199,58 @@ def stable_python(executable, candidates=("/opt/homebrew/bin/python3", "/usr/loc
     return executable
 
 
+def _etime(text):
+    """Seconds from ps's etime, `[[dd-]hh:]mm:ss`; None when it does not parse."""
+    try:
+        days, _, rest = text.rpartition("-")
+        parts = [int(x) for x in rest.split(":")]
+        if not 1 <= len(parts) <= 3:
+            return None
+        secs = 0
+        for x in parts:
+            secs = secs * 60 + x
+        return secs + (int(days) * 86400 if days else 0)
+    except ValueError:
+        return None
+
+
 def _ttys(run):
-    """{pid: tty} from ps; "??" is no controlling terminal."""
+    """{pid: (tty, age_seconds or None)} from ps; "??" is no controlling terminal."""
     out = {}
-    for line in run([_tool("ps"), "-axo", "pid=,tty="]).splitlines():
+    for line in run([_tool("ps"), "-axo", "pid=,tty=,etime="]).splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0].isdigit():
-            out[int(parts[0])] = parts[1]
+        if len(parts) >= 2 and parts[0].isdigit():
+            out[int(parts[0])] = (parts[1], _etime(parts[2]) if len(parts) > 2 else None)
     return out
 
 
-def kill_in(root, log, exclude=(), run=_run, wait=10.0):
+def kill_in(root, log, exclude=(), run=_run, wait=10.0, since=None):
     """Stop what a gate left running under `root` (the ticket's checkout): there is no scope to stop on
     macOS, and a gate's dev servers, test databases or emulators can leave its process group. Run it
-    after the gate's own group is gone. Only processes without a terminal: the gate's all start with
-    no tty, while a person's shell, editor or Claude session `cd`'d into the checkout has one, and
-    is left alone (and logged). Returns the pids it signalled."""
-    root = str(root).rstrip("/")
+    after the gate's own group is gone. Spared, and logged: a process with a terminal (a person's shell
+    `cd`'d into the checkout), and, given `since` (epoch seconds the gate started), anything that started
+    before it or whose age ps cannot tell (an editor's language server, a background Claude session).
+    Returns the pids it signalled."""
+    root = os.path.realpath(str(root)).rstrip("/")
     try:
         procs = read_proc(run=run, ours=[root])
         ttys = _ttys(run)
     except (OSError, subprocess.SubprocessError):
         return []
     inside = [pid for pid, p in procs.items() if p[2] == "sluicy-gate" and pid not in exclude and pid > 1]
-    kept = sorted(pid for pid in inside if ttys.get(pid, "??") not in ("??", "?", "-"))
+    max_age = None if since is None else time.time() - since + 2  # 2 s: ps rounds etime down to the second
+
+    def spared(pid):
+        tty, age = ttys.get(pid, ("??", None))
+        if tty not in ("??", "?", "-"):
+            return True
+        return max_age is not None and (age is None or age > max_age)
+
+    kept = sorted(pid for pid in inside if spared(pid))
     left = sorted(pid for pid in inside if pid not in kept)
     if kept:
-        log.write(f"sluicy: leaving {len(kept)} process(es) with a terminal in {root}: {' '.join(map(str, kept))}\n")
+        log.write(f"sluicy: leaving {len(kept)} process(es) in {root} (on a terminal or older than the gate): "
+                  f"{' '.join(map(str, kept))}\n")
     if not left:
         log.flush()
         return []
@@ -227,14 +266,16 @@ def kill_in(root, log, exclude=(), run=_run, wait=10.0):
                 pass
             except PermissionError:
                 pass
-        if sig == signal.SIGTERM and alive:
+        if sig == signal.SIGTERM:
+            signalled = alive
             deadline = time.monotonic() + wait
             while time.monotonic() < deadline and any(_alive(p) for p in alive):
                 time.sleep(0.2)
+            # Only what we signalled and is still there: never SIGKILL a pid that exited (and may be reused).
             left = [p for p in alive if _alive(p)]
             if not left:
                 break
-    return sorted(set(alive) | set(left))
+    return sorted(set(signalled))
 
 
 def _alive(pid):

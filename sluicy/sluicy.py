@@ -225,6 +225,9 @@ def clean_env(extra=None):
         g = P.cfg["gate"]
         names |= set(g["waivers"]) | set(g["strip_env"]) | set(g["env"]) | set(P.cfg["preflight"]["env"])
         prefixes = tuple(g["strip_prefixes"])
+    # PATH is never stripped: a `[gate.env*]` PATH applies to the push alone, and preflight, the map and the
+    # worker still need the one they were started with.
+    names.discard("PATH")
     env = {k: v for k, v in os.environ.items() if k not in names and not (prefixes and k.startswith(prefixes))}
     env.update(extra or {})
     return env
@@ -498,11 +501,12 @@ def stop_gate(tid, log, project=None):
     log.flush()
 
 
-def sweep_gate(log):
+def sweep_gate(log, since):
     """macOS, once the gate's process group is gone: no scope held its tree, so stop what it left
-    running in the checkout (see platform_macos.kill_in). Nothing to do on Linux."""
+    running in the checkout since the push started at `since` (see platform_macos.kill_in). Nothing to
+    do on Linux."""
     if MACOS and P is not None:
-        plat.kill_in(checkout(), log, exclude={os.getpid()})
+        plat.kill_in(checkout(), log, exclude={os.getpid()}, since=since)
 
 
 def oomd_killed_gate(tid, since):
@@ -554,6 +558,7 @@ def run_gated_push(conn, tid, env, log):
             log.write(f"\nsluicy brake: {reason}; stopping the gate\n")
             log.flush()
             stop_gate(tid, log)
+            braked_at = time.monotonic()
             try:
                 os.killpg(proc.pid, 15)
             except ProcessLookupError:
@@ -563,7 +568,17 @@ def run_gated_push(conn, tid, env, log):
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, 9)
                 proc.wait()
-            sweep_gate(log)
+            if MACOS:
+                # No scope took the group down with it: git can exit at once while browsers or a test
+                # database in its group ignore SIGTERM. Same 30 s grace, counted from the SIGTERM.
+                deadline = braked_at + 30
+                while group_alive(proc.pid) and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                try:
+                    os.killpg(proc.pid, 9)
+                except OSError:  # gone, or not ours to signal
+                    pass
+            sweep_gate(log, started)
             return reason
         time.sleep(poll)
     if proc.returncode != 0 and oomd_killed_gate(tid, started):
@@ -826,7 +841,8 @@ def settle_orphan_push(t):
     finish (bounded), then stop whatever is left, so the next merge never resets the checkout under it."""
     with open(t["log_path"], "a") as log:
         pgid = t["push_pgid"]
-        if pgid and group_alive(pgid):
+        orphan = bool(pgid and group_alive(pgid))
+        if orphan:
             log.write(f"\nsluicy: waiting for the previous worker's push (pgid {pgid})\n")
             log.flush()
             deadline = time.monotonic() + _env_float("SLUICY_ORPHAN_WAIT", 1200)
@@ -843,7 +859,9 @@ def settle_orphan_push(t):
                     pass
         # A gate scope can outlive its push: systemd keeps the scope when the push itself is killed.
         stop_gate(t["id"], log)
-        sweep_gate(log)
+        if orphan:
+            # updated_at is when push_pgid was written, just after the push started (minus a margin).
+            sweep_gate(log, t["updated_at"] - 5)
 
 
 def mark_live(conn, t, old_stamps=None):
@@ -1746,10 +1764,25 @@ def read_proc(root):
     return procs
 
 
+def our_roots():
+    """Every directory sluicy's gates, preflights and maps work in: the default checkouts root and each
+    registered project's checkout with its -preflight and -map trees (a project may live anywhere)."""
+    roots = [str(checkouts_root())]
+    for v in ("SLUICY_PREFLIGHT_DIR", "SLUICY_MAP_DIR"):
+        if os.environ.get(v):
+            roots.append(os.environ[v])
+    try:
+        for row in db().execute("SELECT checkout FROM projects"):
+            roots += [row["checkout"], f"{row['checkout']}-preflight", f"{row['checkout']}-map"]
+    except sqlite3.Error:
+        pass
+    return roots
+
+
 def current_procs():
     """Every process now, from /proc (or a /proc-shaped SLUICY_PROC); on macOS from ps and lsof."""
     if MACOS and not os.environ.get("SLUICY_PROC"):
-        return plat.read_proc(ours=[str(checkouts_root())])
+        return plat.read_proc(ours=our_roots())
     return read_proc(os.environ.get("SLUICY_PROC", "/proc"))
 
 
@@ -1920,7 +1953,8 @@ def leftovers(path, main):
 
 def process_inside(path):
     procs = current_procs()
-    path = str(path).rstrip("/")
+    # macOS's lsof reports resolved cwds (Linux /proc does too, but its tests use plain paths).
+    path = (os.path.realpath(str(path)) if MACOS else str(path)).rstrip("/")
     return next((pid for pid, p in procs.items() if p[3] == path or p[3].startswith(path + "/")), None)
 
 

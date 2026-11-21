@@ -8,7 +8,7 @@
 #
 # Then, in each repository: add a .sluicy.toml (see examples/) and run `sluicy init`.
 set -euo pipefail
-root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 hooks=1
 deck=1
 for arg in "$@"; do

@@ -17,12 +17,27 @@
     policy. The agent runs at standard priority, and the gate itself runs at nice 10, as Linux's scope does.
   - A brake or an orphaned push also stops processes that left the gate's process group but still work
     in the ticket's checkout (dev servers, test databases). It runs after the group has had its 30 s to
-    exit, and never touches a process on a terminal, such as your shell or editor.
+    exit, and never touches a process on a terminal (your shell) or one that started before the push (an
+    editor's language server, a background Claude session).
   - The launch agent uses Homebrew's unversioned `python3` link when it is the same interpreter, so a
     Python upgrade doesn't strand it. `bootstrap` retries once while the old job unloads.
   - A memory figure the governor can't read alerts once, and if it happens during a gate it says the brake is off.
   - Deck: processes, memory, CPU, load and session liveness come from libproc, sysctl and Mach on
     macOS. Before this the header read "0% memory available" and every session looked dead.
+- macOS fixes from the Linux-side review:
+  - A failing `sysctl` no longer fails the push through the gate's (unenforced) memory cap.
+  - The launch agent carries the installing shell's PATH, so the conductor and the workers it starts
+    find Homebrew's git, node and npm.
+  - Every registered project's checkout, `-preflight` and `-map` tree counts as sluicy's own, not just
+    the default checkouts root, so a gate in a custom checkout is never flagged as a hog.
+  - A brake also SIGKILLs what is left of the gate's process group after 30 s (no scope does it).
+  - An orphaned-push sweep runs only when there was an orphan.
+  - `lsof` reads this user's processes only, and keeps its output when it exits 1; paths are compared
+    resolved (`/private/tmp`, symlinked checkouts).
+  - The sweep never sends SIGKILL to a pid that already exited.
+  - `install.sh`/`uninstall.sh` no longer need `readlink -f` (BSD has it only from macOS 12.3).
+- A `[gate.env*]` PATH applies to the push only; preflight, the map and the worker keep their own PATH
+  instead of losing it.
 
 ## 0.2.1 - 2026-11-13
 

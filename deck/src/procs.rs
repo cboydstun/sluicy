@@ -615,7 +615,9 @@ mod mac {
         Some((t.iter().sum(), t[libc::CPU_STATE_IDLE as usize]))
     }
 
-    fn sysctl_raw<T>(name: &str) -> Option<T> {
+    // Only for plain-old-data `T` (integers, `xsw_usage`): `zeroed()` must be a valid value of it, and the
+    // kernel writes raw bytes into it.
+    fn sysctl_raw<T: Copy>(name: &str) -> Option<T> {
         let name = CString::new(name).ok()?;
         let mut value: T = unsafe { zeroed() };
         let mut size = size_of::<T>();
